@@ -5,6 +5,7 @@ import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from "@go
 import type { ChatMessage, Lesson } from "./types";
 import { apiFetch } from "./client-api";
 import { base64ToBytes, bytesToBase64, PCM_WORKLET_SOURCE, pcm16ToFloat32 } from "./gemini-audio";
+import { geminiVisualParts, loadVoiceContext, normalizeVoiceVisuals, type VoiceContext } from "./voice-context";
 
 export type GeminiVoiceTutorOptions = {
   lesson: Lesson | null;
@@ -35,6 +36,9 @@ type GeminiSession = {
   outputStartedAt: string | null;
   transcriptIds: Set<string>;
   playbackWarning: boolean;
+  context: VoiceContext;
+  contextSegment: number;
+  requestVersion: number;
 };
 
 function teachingRequest(lesson: Lesson, index: number) {
@@ -43,11 +47,12 @@ function teachingRequest(lesson: Lesson, index: number) {
     "Hãy tiếp tục làm gia sư theo hướng dẫn của phiên học. Giảng bằng tiếng Việt.",
     `Bài học: ${lesson.title}. Phần ${index + 1}/${lesson.segments.length}: ${segment?.title || lesson.title}.`,
     `Nội dung phần này: ${segment?.explanation || ""}`,
+    segment?.illustration?.description ? `Sơ đồ minh họa đang hiển thị cho học viên: ${segment.illustration.description}. Giải thích các thành phần và mối liên hệ trong sơ đồ.` : "",
     "Giải thích trong 45–90 giây, đưa ví dụ rồi hỏi một câu kiểm tra mức độ hiểu. Chờ học viên trả lời; không tự chuyển phần. Khi học viên ngắt lời, dừng và giải thích điều họ chưa hiểu.",
   ].join("\n").slice(0, 9000);
 }
 
-/** Direct Gemini Live connection with a short-lived token issued by our local server. */
+/** Direct Gemini Live uses a short-lived token made with the user's own browser key. */
 export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -72,7 +77,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     }).then(response => {
       if (!response.ok) throw new Error("transcript_save_failed");
     }).catch(() => {
-      if (mounted.current && active.current === session) latest.current.onError("Chưa lưu được bản ghi lời nói. Hãy kiểm tra kết nối.");
+      if (mounted.current && active.current === session) latest.current.onError("Chưa lưu được bản ghi lời nói trên trình duyệt. Hãy kiểm tra bộ nhớ trình duyệt.");
     });
   }, []);
 
@@ -152,6 +157,19 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     if (mounted.current && active.current === session) setSpeaking(true);
   }, []);
 
+  const refreshContext = useCallback(async (session: GeminiSession, segmentIndex: number, requestVersion: number) => {
+    if (session.contextSegment === segmentIndex) return true;
+    const context = await loadVoiceContext(session.lessonId, segmentIndex, session.abort.signal);
+    if (active.current !== session || !session.live || session.requestVersion !== requestVersion || latest.current.segmentIndex !== segmentIndex) return false;
+    session.live.sendClientContent({ turns: [{ role: "user", parts: [
+      { text: `Cập nhật phần đang học và nguồn để giảng tiếp:\n${context.instructions}` },
+      ...geminiVisualParts(context.visualContext),
+    ] }], turnComplete: false });
+    session.context = context;
+    session.contextSegment = segmentIndex;
+    return true;
+  }, []);
+
   const start = useCallback(async () => {
     if (active.current) { await resumeAudio(active.current); return; }
     const { lesson, segmentIndex } = latest.current;
@@ -171,6 +189,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       source: null, worklet: null, workletUrl: null, abort: new AbortController(), timer: null,
       outputs: new Set(), nextPlaybackTime: 0, muted: false, input: null, output: null,
       inputStartedAt: null, outputStartedAt: null, transcriptIds: new Set(), playbackWarning: false,
+      context: { visualContext: [], instructions: "" }, contextSegment: segmentIndex, requestVersion: 0,
     };
     active.current = session; setConnecting(true); setMuted(false);
     const fail = (message: string) => {
@@ -205,6 +224,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     };
     try {
       await resumeAudio(session);
+      if (active.current !== session) return;
       const microphone = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       if (active.current !== session) { microphone.getTracks().forEach(track => track.stop()); return; }
       session.microphone = microphone;
@@ -217,10 +237,11 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lessonId: lesson.id, segmentIndex }), signal: session.abort.signal,
       });
-      const token = await response.json() as { value?: string; model?: string; provider?: string; error?: string };
+      const token = await response.json() as { value?: string; model?: string; provider?: string; error?: string; instructions?: string; visualContext?: unknown };
       if (active.current !== session) return;
       if (!response.ok) throw new Error(token.error || "Chưa khởi tạo được phiên giọng nói Gemini.");
       if (!token.value || !token.model || token.provider !== "gemini") throw new Error("Cấu hình giọng nói đã thay đổi. Hãy tải lại trang.");
+      session.context = { visualContext: normalizeVoiceVisuals(token.visualContext), instructions: token.instructions || "" };
       const client = new GoogleGenAI({ apiKey: token.value, httpOptions: { apiVersion: "v1beta" } });
       const live = await client.live.connect({
         model: token.model, config: { responseModalities: [Modality.AUDIO], abortSignal: session.abort.signal },
@@ -242,17 +263,24 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       session.source.connect(session.worklet); session.worklet.connect(captureContext.destination);
       if (session.timer) clearTimeout(session.timer); session.timer = null;
       setConnected(true); setConnecting(false);
-      live.sendClientContent({ turns: [{ role: "user", parts: [{ text: teachingRequest(lesson, segmentIndex) }] }], turnComplete: true });
+      const currentIndex = latest.current.segmentIndex;
+      const requestVersion = ++session.requestVersion;
+      if (!await refreshContext(session, currentIndex, requestVersion)) return;
+      if (active.current !== session) return;
+      live.sendClientContent({ turns: [{ role: "user", parts: [
+        ...(currentIndex === segmentIndex ? geminiVisualParts(session.context.visualContext) : []),
+        { text: teachingRequest(lesson, currentIndex) },
+      ] }], turnComplete: true });
     } catch (error) {
       if (active.current !== session) return;
       const name = error instanceof Error ? error.name : "";
       const message = error instanceof Error ? error.message : "";
       fail(name === "NotAllowedError" ? "Bạn cần cho phép truy cập micro để trò chuyện với gia sư."
         : name === "NotFoundError" ? "Chưa tìm thấy micro. Hãy kết nối micro rồi thử lại."
-          : message.startsWith("Chưa ") || message.startsWith("Cấu hình ") || message.startsWith("Dịch vụ ") ? message
+          : /^(Chưa |Cấu hình |Dịch vụ |Hãy |Khóa |Model |OpenAI |Gemini )/.test(message) ? message
             : "Chưa kết nối được Gemini Live. Hãy kiểm tra khóa API, quyền model và kết nối mạng.");
     }
-  }, [clearPlayback, flush, queueAudio, resumeAudio, stop]);
+  }, [clearPlayback, flush, queueAudio, refreshContext, resumeAudio, stop]);
 
   const toggleMute = useCallback(() => {
     const session = active.current; if (!session?.microphone || !session.live) return;
@@ -272,20 +300,28 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     if (!session?.live) { latest.current.onError("Hãy bắt đầu phiên giọng nói trước khi gửi câu hỏi."); return; }
     await resumeAudio(session); if (active.current !== session) return;
     clearPlayback(session); flush(session, "assistant");
+    const requestVersion = ++session.requestVersion;
     try {
+      if (!await refreshContext(session, latest.current.segmentIndex, requestVersion)) return;
+      if (active.current !== session || session.requestVersion !== requestVersion) return;
       session.live.sendClientContent({ turns: [{ role: "user", parts: [{ text: content }] }], turnComplete: true });
       persist(session, "user", { id: `gemini-user-${crypto.randomUUID()}`, text: content, createdAt: new Date().toISOString() });
     } catch { latest.current.onError("Chưa gửi được câu hỏi. Hãy kết nối lại phiên giọng nói."); }
-  }, [clearPlayback, flush, persist, resumeAudio]);
+  }, [clearPlayback, flush, persist, refreshContext, resumeAudio]);
 
   const teach = useCallback(async () => {
     const session = active.current; const { lesson, segmentIndex } = latest.current;
     if (!session?.live || !lesson) { latest.current.onError("Hãy chọn bài học và bắt đầu phiên giọng nói trước khi giảng tiếp."); return; }
     await resumeAudio(session); if (active.current !== session) return;
     clearPlayback(session); flush(session, "assistant");
-    try { session.live.sendClientContent({ turns: [{ role: "user", parts: [{ text: teachingRequest(lesson, segmentIndex) }] }], turnComplete: true }); }
+    const requestVersion = ++session.requestVersion;
+    try {
+      if (!await refreshContext(session, segmentIndex, requestVersion)) return;
+      if (active.current !== session || session.requestVersion !== requestVersion) return;
+      session.live.sendClientContent({ turns: [{ role: "user", parts: [{ text: teachingRequest(lesson, segmentIndex) }] }], turnComplete: true });
+    }
     catch { latest.current.onError("Chưa yêu cầu giảng tiếp được. Hãy kết nối lại phiên giọng nói."); }
-  }, [clearPlayback, flush, resumeAudio]);
+  }, [clearPlayback, flush, refreshContext, resumeAudio]);
 
   return { connected, connecting, speaking, muted, start, stop, toggleMute, ask, teach };
 }

@@ -1,6 +1,6 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { z } from "zod";
-import type { AiPreferences, AiProvider, AiSettingsState } from "./types";
+import type { AiPreferences, AiProvider, AiSettingsState, SourceImage } from "./types";
 import type { BrowserStorage } from "./browser-storage";
 
 /** All credentials come from this browser's private profile, never the published bundle. */
@@ -53,7 +53,7 @@ export async function getAiConfig(storage: BrowserStorage) {
 export type BrowserAiConfig = Awaited<ReturnType<typeof getAiConfig>>;
 export type TextGeneration = {
   instructions: string;
-  messages: { role: "user" | "assistant"; content: string }[];
+  messages: { role: "user" | "assistant"; content: string; images?: SourceImage[] }[];
   schema: Record<string, unknown>; schemaName: string; maxOutputTokens: number; signal?: AbortSignal | null;
 };
 
@@ -95,7 +95,10 @@ export function createGeminiPayload(input: TextGeneration) {
   // https://ai.google.dev/api/generate-content#TextResponseFormat
   return {
     systemInstruction: { parts: [{ text: input.instructions }] },
-    contents: input.messages.map(message => ({ role: message.role === "assistant" ? "model" : "user", parts: [{ text: message.content }] })),
+    contents: input.messages.map(message => ({ role: message.role === "assistant" ? "model" : "user", parts: [
+      { text: message.content },
+      ...(message.images || []).flatMap(image => [{ text: image.label }, { inlineData: { mimeType: image.mimeType, data: image.dataUrl.slice(image.dataUrl.indexOf(",") + 1) } }]),
+    ] })),
     generationConfig: { candidateCount: 1, maxOutputTokens: input.maxOutputTokens, responseFormat: { text: { mimeType: "APPLICATION_JSON", schema: input.schema } } },
     store: false,
   };
@@ -135,7 +138,10 @@ export async function generateTutorText(storage: BrowserStorage, input: TextGene
   }
   const result = await providerRequest("openai", "https://api.openai.com/v1/responses", {
     method: "POST", headers: { Authorization: `Bearer ${config.key}`, "Content-Type": "application/json" }, signal,
-    body: JSON.stringify({ model: config.textModel, store: false, max_output_tokens: input.maxOutputTokens, instructions: input.instructions, input: input.messages, text: { format: { type: "json_schema", name: input.schemaName, strict: true, schema: input.schema } } }),
+    body: JSON.stringify({ model: config.textModel, store: false, max_output_tokens: input.maxOutputTokens, instructions: input.instructions, input: input.messages.map(message => ({ role: message.role, content: [
+      { type: "input_text", text: message.content },
+      ...(message.images || []).flatMap(image => [{ type: "input_text", text: image.label }, { type: "input_image", image_url: image.dataUrl, detail: "high" }]),
+    ] })), text: { format: { type: "json_schema", name: input.schemaName, strict: true, schema: input.schema } } }),
   }, fetchImplementation);
   return extractOpenAiText(result);
 }

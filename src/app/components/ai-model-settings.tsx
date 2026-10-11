@@ -9,11 +9,12 @@ type Props = {
   value: AiSettingsState;
   onSaved: (state: AiSettingsState) => void;
   onError: (message: string) => void;
+  busy?: boolean;
 };
 type Model = { id: string; label: string };
 const CUSTOM_MODEL = "__custom_model__";
 
-function ModelChoice({ id, label, models, value, onChange }: {
+export function ModelChoice({ id, label, models, value, onChange }: {
   id: string; label: string; models: Model[]; value: string; onChange: (value: string) => void;
 }) {
   const [custom, setCustom] = useState(!models.some(model => model.id === value));
@@ -38,9 +39,10 @@ function ModelChoice({ id, label, models, value, onChange }: {
   </div>;
 }
 
-export function AiModelSettings({ value, onSaved, onError }: Props) {
+export function AiModelSettings({ value, onSaved, onError, busy = false }: Props) {
   const [draft, setDraft] = useState(value.preferences);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [notice, setNotice] = useState("");
   const [keys, setKeys] = useState<Record<AiProvider, string>>({ gemini: "", openai: "" });
   const [removeKeys, setRemoveKeys] = useState<Record<AiProvider, boolean>>({ gemini: false, openai: false });
@@ -59,7 +61,7 @@ export function AiModelSettings({ value, onSaved, onError }: Props) {
     || keys.gemini.trim() !== "" || keys.openai.trim() !== "" || removeKeys.gemini || removeKeys.openai;
 
   async function save(event: React.FormEvent) {
-    event.preventDefault(); if (saving) return;
+    event.preventDefault(); if (saving || testing || busy) return;
     setSaving(true); setNotice("");
     try {
       const credentials: Partial<Record<AiProvider, string>> = {};
@@ -80,13 +82,26 @@ export function AiModelSettings({ value, onSaved, onError }: Props) {
     finally { setSaving(false); }
   }
 
+  async function testConnection() {
+    if (testing || saving || busy) return;
+    setTesting(true); setNotice("");
+    try {
+      const response = await apiFetch("/api/ai/test", { method: "POST" });
+      const result = await response.json() as { message?: string; error?: string; provider?: string; textModel?: string };
+      if (!response.ok) throw new Error(result.error || "Chưa kết nối được dịch vụ AI.");
+      setNotice(result.message || `Đã kiểm tra kết nối AI với model ${result.textModel || "đã chọn"}.`);
+    } catch (error) { onError(error instanceof Error ? error.message : "Chưa kiểm tra được kết nối AI."); }
+    finally { setTesting(false); }
+  }
+
   return <form className="settings-form ai-model-settings" onSubmit={event => void save(event)}>
     <section className="settings-card ai-model-card" aria-labelledby={`${id}-heading`}>
       <div className="settings-card-heading">
         <span className="step-icon mint"><Cpu size={21} /></span>
         <div><h2 id={`${id}-heading`}>Chọn dịch vụ và model AI</h2><p>Lựa chọn dùng chung cho các môn học trong trình duyệt này.</p></div>
       </div>
-      <fieldset disabled={saving} className="ai-model-fields">
+      {busy && <p className="field-note ai-test-hint" role="status">Gia sư đang xử lý yêu cầu. Bạn có thể đổi khóa hoặc model khi hoàn tất.</p>}
+      <fieldset disabled={saving || testing || busy} className="ai-model-fields">
         <label htmlFor={`${id}-provider`}>Dịch vụ AI
           <select id={`${id}-provider`} value={draft.provider} onChange={event => {
             setDraft(current => ({ ...current, provider: event.target.value as AiSettingsState["preferences"]["provider"] }));
@@ -135,10 +150,12 @@ export function AiModelSettings({ value, onSaved, onError }: Props) {
         </>}
       </fieldset>
       <div className="settings-save ai-model-save"><span><AudioLines size={15} />Thay đổi áp dụng cho bài giảng, câu trả lời và phiên giọng nói mới.</span>
-        <button className="button primary" type="submit" disabled={saving || !changed}>
+        <div className="ai-settings-actions"><button className="button secondary" type="button" disabled={saving || testing || changed || busy} onClick={() => void testConnection()}>{testing ? <LoaderCircle className="spin" size={16} /> : <Cpu size={16} />}{testing ? "Đang kiểm tra…" : "Kiểm tra kết nối AI"}</button>
+        <button className="button primary" type="submit" disabled={saving || testing || !changed || busy}>
           {saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving ? "Đang lưu…" : "Lưu lựa chọn AI"}
-        </button>
+        </button></div>
       </div>
+      {changed && <p className="field-note ai-test-hint">Lưu khóa và lựa chọn trước khi kiểm tra kết nối. Kiểm tra dùng một yêu cầu API nhỏ; giọng nói được kiểm tra khi bạn bắt đầu phiên học.</p>}
       {notice && <p className="ai-model-saved" role="status"><Check size={15} />{notice}</p>}
     </section>
   </form>;

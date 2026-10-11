@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatMessage, Lesson } from "./types";
 import { apiFetch } from "./client-api";
 import { useGeminiVoiceTutor } from "./use-gemini-voice-tutor";
+import { fitOpenAiVoiceVisual, loadVoiceContext, normalizeVoiceVisuals, openAiVisualEvent, type VoiceContext } from "./voice-context";
 
 type VoiceTutorOptions = {
   provider?: "gemini" | "openai";
@@ -29,6 +30,9 @@ type VoiceSession = {
   transcriptIds: Set<string>;
   itemTimes: Map<string, string>;
   playbackWarning: boolean;
+  context: VoiceContext;
+  contextSegment: number;
+  requestVersion: number;
 };
 
 type RealtimeEvent = {
@@ -48,6 +52,7 @@ function teachingInstructions(lesson: Lesson, index: number): string {
     "Tiếp tục làm gia sư theo hướng dẫn của phiên học. Giảng bằng tiếng Việt, rõ ràng và từng đoạn ngắn.",
     `Bài học: ${lesson.title}. Phần đang học: ${index + 1}/${lesson.segments.length}: ${segment?.title ?? lesson.title}.`,
     segment?.explanation ? `Nội dung phần này: ${segment.explanation}` : "",
+    segment?.illustration?.description ? `Sơ đồ minh họa đang hiển thị cho học viên: ${segment.illustration.description}. Hãy giải thích các thành phần và mối liên hệ trong sơ đồ.` : "",
     "Giải thích phần đang học, đưa một ví dụ dễ hiểu, sau đó hỏi một câu kiểm tra mức độ hiểu và chờ học viên trả lời. Không tự chuyển sang phần tiếp theo.",
     "Ưu tiên học liệu của phiên học. Nếu học viên hỏi chen, dừng giảng để trả lời rồi hỏi họ có muốn tiếp tục không.",
   ].filter(Boolean).join("\n");
@@ -56,7 +61,10 @@ function teachingInstructions(lesson: Lesson, index: number): string {
 function sendEvent(session: VoiceSession, event: Record<string, unknown>): boolean {
   if (session.channel.readyState !== "open") return false;
   try {
-    session.channel.send(JSON.stringify(event));
+    const payload = JSON.stringify(event);
+    const limit = session.peer.sctp?.maxMessageSize;
+    if (limit && new TextEncoder().encode(payload).byteLength > limit) return false;
+    session.channel.send(payload);
     return true;
   } catch {
     return false;
@@ -85,7 +93,7 @@ function createResponse(session: VoiceSession, instructions = ""): void {
   });
 }
 
-/** A browser WebRTC client. The long-lived API key stays in /api/voice/session. */
+/** WebRTC uses a short-lived token; the personal key stays in this browser's private settings. */
 function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -95,7 +103,7 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
   const mounted = useRef(true);
   const active = useRef<VoiceSession | null>(null);
 
-  useEffect(() => { latest.current = options; }, [options]);
+  latest.current = options;
 
   const stop = useCallback(() => {
     const session = active.current;
@@ -152,6 +160,38 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
     });
   }, []);
 
+  const sendContext = useCallback(async (session: VoiceSession, context: VoiceContext, includeInstructions = false, requestVersion = session.requestVersion) => {
+    let complete = true;
+    for (const visual of context.visualContext) {
+      const fitted = await fitOpenAiVoiceVisual(visual, session.peer.sctp?.maxMessageSize || 262144);
+      if (active.current !== session || session.requestVersion !== requestVersion) return;
+      if (!fitted || !sendEvent(session, openAiVisualEvent(fitted))) {
+        complete = false;
+        sendEvent(session, { type: "conversation.item.create", item: { type: "message", role: "user", content: [{
+          type: "input_text", text: `Không truyền được hình ${visual.label} trong phiên giọng nói. Không đoán chi tiết của hình này; nói rõ cần xem hình ở phần Hỏi gia sư.`,
+        }] } });
+      }
+    }
+    if (active.current !== session || session.requestVersion !== requestVersion) return;
+    if (includeInstructions && context.instructions) {
+      complete = sendEvent(session, { type: "conversation.item.create", item: {
+        type: "message", role: "user", content: [{ type: "input_text", text: `Cập nhật phần đang học và nguồn để giảng tiếp:\n${context.instructions}` }],
+      } }) && complete;
+    }
+    if (!complete) latest.current.onError("Một hình trong học liệu vượt giới hạn kênh giọng nói. Gia sư có thể giảng nội dung chữ; hãy dùng phần Hỏi gia sư để giải thích hình đó.");
+  }, []);
+
+  const refreshContext = useCallback(async (session: VoiceSession, segmentIndex: number, requestVersion: number) => {
+    if (session.contextSegment === segmentIndex) return true;
+    const context = await loadVoiceContext(session.lessonId, segmentIndex, session.abort.signal);
+    if (active.current !== session || session.requestVersion !== requestVersion || latest.current.segmentIndex !== segmentIndex) return false;
+    await sendContext(session, context, true);
+    if (active.current !== session || session.requestVersion !== requestVersion || latest.current.segmentIndex !== segmentIndex) return false;
+    session.context = context;
+    session.contextSegment = segmentIndex;
+    return true;
+  }, [sendContext]);
+
   const start = useCallback(async () => {
     if (active.current) {
       playAudio(active.current);
@@ -200,6 +240,9 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       transcriptIds: new Set(),
       itemTimes: new Map(),
       playbackWarning: false,
+      context: { visualContext: [], instructions: "" },
+      contextSegment: segmentIndex,
+      requestVersion: 0,
     };
     active.current = session;
     setConnecting(true);
@@ -229,12 +272,12 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
         if (!response.ok) throw new Error("transcript_save_failed");
       }).catch(() => {
         if (mounted.current && active.current === session) {
-          latest.current.onError("Cuộc trò chuyện vẫn tiếp tục, nhưng chưa lưu được bản ghi. Hãy kiểm tra kết nối mạng.");
+          latest.current.onError("Cuộc trò chuyện vẫn tiếp tục, nhưng chưa lưu được bản ghi trên trình duyệt. Hãy kiểm tra bộ nhớ của trình duyệt.");
         }
       });
     };
 
-    session.channel.onopen = () => {
+    session.channel.onopen = async () => {
       if (active.current !== session) return;
       if (session.timer) clearTimeout(session.timer);
       session.timer = null;
@@ -242,7 +285,15 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       setConnected(true);
       playAudio(session);
       const current = latest.current;
-      createResponse(session, teachingInstructions(lesson, current.lesson?.id === lesson.id ? current.segmentIndex : segmentIndex));
+      const currentIndex = current.lesson?.id === lesson.id ? current.segmentIndex : segmentIndex;
+      const requestVersion = ++session.requestVersion;
+      try {
+        if (currentIndex === segmentIndex) await sendContext(session, session.context);
+        else if (!await refreshContext(session, currentIndex, requestVersion)) return;
+        if (active.current === session && session.requestVersion === requestVersion) createResponse(session, teachingInstructions(lesson, currentIndex));
+      } catch {
+        if (active.current === session) latest.current.onError("Chưa đọc được học liệu của phần đang học. Hãy bấm giảng tiếp lại.");
+      }
     };
     session.channel.onclose = () => fail("Phiên giọng nói đã kết thúc. Bạn có thể bấm bắt đầu để kết nối lại.");
     session.channel.onerror = () => fail("Kết nối giọng nói bị gián đoạn. Hãy thử bắt đầu lại.");
@@ -352,11 +403,10 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
         signal: session.abort.signal,
       });
       if (active.current !== session) return;
-      if (!tokenResponse.ok) {
-        throw new Error(tokenResponse.status === 503 ? "voice_unconfigured" : "voice_session_failed");
-      }
-      const token = await tokenResponse.json() as { value?: string; model?: string };
-      if (!token.value) throw new Error("voice_session_failed");
+      const token = await tokenResponse.json() as { value?: string; model?: string; provider?: string; error?: string; instructions?: string; visualContext?: unknown };
+      if (!tokenResponse.ok) throw new Error(token.error || "Chưa khởi tạo được phiên giọng nói OpenAI.");
+      if (!token.value || token.provider !== "openai") throw new Error("Cấu hình giọng nói đã thay đổi. Hãy tải lại trang.");
+      session.context = { visualContext: normalizeVoiceVisuals(token.visualContext), instructions: token.instructions || "" };
       const offer = await peer.createOffer();
       if (active.current !== session) return;
       await peer.setLocalDescription(offer);
@@ -380,11 +430,11 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
         ? "Bạn cần cho phép truy cập micro để trò chuyện với gia sư."
         : name === "NotFoundError"
           ? "Chưa tìm thấy micro. Hãy kết nối micro và thử lại."
-          : code === "voice_unconfigured"
-            ? "Giọng nói AI chưa được cấu hình. Cần kết nối dịch vụ AI trên máy chủ trước khi bắt đầu."
+          : /^(Chưa |Cấu hình |Dịch vụ |Hãy |Khóa |Model |OpenAI |Gemini )/.test(code)
+            ? code
             : "Chưa kết nối được gia sư bằng giọng nói. Hãy kiểm tra mạng và thử lại.");
     }
-  }, [playAudio, stop]);
+  }, [playAudio, refreshContext, sendContext, stop]);
 
   const toggleMute = useCallback(() => {
     const session = active.current;
@@ -395,8 +445,8 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
     if (mounted.current) setMuted(next);
   }, []);
 
-  const ask = useCallback((text: string) => {
-    const content = text.trim();
+  const ask = useCallback(async (text: string) => {
+    const content = text.trim().slice(0, 4000);
     if (!content) return;
     const session = active.current;
     if (!session || session.channel.readyState !== "open") {
@@ -404,6 +454,14 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       return;
     }
     playAudio(session);
+    const requestVersion = ++session.requestVersion;
+    try {
+      if (!await refreshContext(session, latest.current.segmentIndex, requestVersion)) return;
+    } catch {
+      if (active.current === session) latest.current.onError("Chưa đọc được học liệu của phần đang học. Hãy thử gửi câu hỏi lại.");
+      return;
+    }
+    if (active.current !== session || session.requestVersion !== requestVersion) return;
     const itemId = crypto.randomUUID().replace(/-/g, "");
     const id = `voice-user-${itemId}`;
     const createdAt = new Date().toISOString();
@@ -422,12 +480,12 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
     }).then((response) => {
       if (!response.ok) throw new Error("transcript_save_failed");
     }).catch(() => {
-      if (mounted.current && active.current === session) latest.current.onError("Chưa lưu được câu hỏi. Hãy kiểm tra kết nối mạng.");
+      if (mounted.current && active.current === session) latest.current.onError("Chưa lưu được câu hỏi trên trình duyệt. Hãy kiểm tra bộ nhớ trình duyệt.");
     });
     createResponse(session);
-  }, [playAudio]);
+  }, [playAudio, refreshContext]);
 
-  const teach = useCallback(() => {
+  const teach = useCallback(async () => {
     const session = active.current;
     const { lesson, segmentIndex } = latest.current;
     if (!lesson || !session || session.channel.readyState !== "open") {
@@ -435,8 +493,16 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       return;
     }
     playAudio(session);
+    const requestVersion = ++session.requestVersion;
+    try {
+      if (!await refreshContext(session, segmentIndex, requestVersion)) return;
+    } catch {
+      if (active.current === session) latest.current.onError("Chưa đọc được học liệu của phần đang học. Hãy bấm giảng tiếp lại.");
+      return;
+    }
+    if (active.current !== session || session.requestVersion !== requestVersion) return;
     createResponse(session, teachingInstructions(lesson, segmentIndex));
-  }, [playAudio]);
+  }, [playAudio, refreshContext]);
 
   return { connected, connecting, speaking, muted, start, stop, toggleMute, ask, teach };
 }

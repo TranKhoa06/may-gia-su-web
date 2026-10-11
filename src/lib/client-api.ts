@@ -1,9 +1,9 @@
 import { z } from "zod";
 import { getBrowserStorage, BrowserStorageError, type BrowserStorage, type StoredMaterial, type StoredLesson } from "./browser-storage";
 import { aiPreferencesSchema, credentialsSchema, buildAiSettingsState, BrowserAiError, createVoiceSession, generateTutorText, getAiConfig } from "./browser-ai";
-import { idSchema, lessonContentSchema, settingsSchema, sourceRefSchema, unitsSchema } from "./validation";
+import { idSchema, lessonContentSchema, settingsSchema, sourceRefSchema, unitsSchema, illustrationSchema } from "./validation";
 import { chatJsonSchema, lessonJsonSchema } from "./lesson-schema";
-import type { ChatMessage, Course, Material, SourceRef, Settings } from "./types";
+import type { ChatMessage, Course, Material, SourceRef, Settings, SourceImage } from "./types";
 
 class ClientApiError extends Error {
   constructor(public status: number, message: string, public code?: string) { super(message); }
@@ -60,13 +60,13 @@ function revokeDownloadUrl(id: string) {
 }
 
 export async function collectSources(storage: BrowserStorage, materialIds: string[], query = "", budget = 70000) {
-  const candidates: { ref: SourceRef; text: string; name: string; score: number; order: number }[] = [];
+  const candidates: { ref: SourceRef; text: string; name: string; score: number; order: number; images: SourceImage[]; visualNotice?: string }[] = [];
   const normalize = (text: string) => text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   const tokens = normalize(query).split(/[^\p{L}\p{N}]+/u).filter(token => token.length >= 3);
   const materials = await Promise.all(materialIds.map(id => materialOrThrow(storage, id)));
   materials.forEach((material, i) => material.units.forEach((unit, j) => {
     const normalized = normalize(unit.text);
-    candidates.push({ ref: { materialId: material.id, index: unit.index, label: unit.label }, text: unit.text, name: material.name, score: tokens.reduce((score, token) => score + (normalized.includes(token) ? 1 : 0), 0), order: j * materials.length + i });
+    candidates.push({ ref: { materialId: material.id, index: unit.index, label: unit.label }, text: unit.text || (unit.images?.length ? "Trang/slide chỉ có hình ảnh; hãy đọc hình được gửi kèm." : ""), name: material.name, images: unit.images || [], visualNotice: unit.visualNotice, score: tokens.reduce((score, token) => score + (normalized.includes(token) ? 1 : 0), 0), order: j * materials.length + i });
   }));
   candidates.sort((a, b) => b.score - a.score || a.order - b.order);
   const selected = []; let length = 0;
@@ -76,9 +76,19 @@ export async function collectSources(storage: BrowserStorage, materialIds: strin
     if (text.length < 20) continue;
     selected.push({ ...candidate, text }); length += text.length;
   }
+  const images: SourceImage[] = []; let imageBytes = 0;
+  // First choose one visual per unit, then extra visuals, so one image-heavy slide
+  // cannot consume the entire multimodal context.
+  for (let round = 0; round < 6; round++) for (const item of selected) {
+    const image = item.images[round];
+    if (!image || images.length >= 8 || imageBytes + image.dataUrl.length > 1200000) continue;
+    images.push({ ...image, label: `[HÌNH NGUỒN materialId=${item.ref.materialId}; index=${item.ref.index}; ${item.ref.label}; ${item.name}] ${image.label}` });
+    imageBytes += image.dataUrl.length;
+  }
   return {
     refs: selected.map(item => item.ref),
-    text: selected.map(item => `[NGUỒN materialId=${item.ref.materialId}; index=${item.ref.index}; ${item.ref.label}; tệp=${item.name}]\n${item.text}\n[/NGUỒN]`).join("\n\n"),
+    images,
+    text: selected.map(item => `[NGUỒN materialId=${item.ref.materialId}; index=${item.ref.index}; ${item.ref.label}; tệp=${item.name}]\n${item.text}${item.visualNotice ? `\nLưu ý về hình: ${item.visualNotice}` : ""}\n[/NGUỒN]`).join("\n\n") + (images.length ? `\n\nCó ${images.length} hình được gửi kèm. Chỉ mô tả chi tiết hình thực sự được gửi. Nếu chưa thấy hình cần thiết, nói rõ và yêu cầu chọn phần tương ứng.` : ""),
   };
 }
 
@@ -122,7 +132,7 @@ async function uploadMaterial(storage: BrowserStorage, init: RequestInit) {
   const magic = new Uint8Array(await file.slice(0, 5).arrayBuffer());
   if ((type === "pdf" && new TextDecoder().decode(magic) !== "%PDF-") || (type === "pptx" && (magic[0] !== 0x50 || magic[1] !== 0x4b || magic[2] !== 3 || magic[3] !== 4))) throw new ClientApiError(400, "Định dạng tệp không khớp với PDF hoặc PPTX.");
   const unitsText = form.get("units");
-  if (typeof unitsText !== "string" || unitsText.length > 650000) throw new ClientApiError(400, "Nội dung học liệu quá dài hoặc chưa được đọc.");
+  if (typeof unitsText !== "string" || unitsText.length > 12 * 1024 * 1024) throw new ClientApiError(400, "Nội dung học liệu quá dài hoặc chưa được đọc.");
   const units = unitsSchema.parse(JSON.parse(unitsText));
   if ((await storage.listMaterials(courseId)).length >= 30) throw new ClientApiError(400, "Mỗi môn hỗ trợ 30 học liệu. Hãy xóa học liệu không dùng trước khi thêm.");
   const material: Material = { id: crypto.randomUUID(), name: file.name.replace(/[\x00-\x1f\x7f/\\]/g, "_").slice(0, 200), type, unitCount: units.length, characters: units.reduce((sum, unit) => sum + unit.text.length, 0), createdAt: new Date().toISOString() };
@@ -142,8 +152,8 @@ async function generateLesson(storage: BrowserStorage, init: RequestInit) {
   rateLimit("lesson", 3);
   const result = await generateTutorText(storage, {
     maxOutputTokens: 10000, signal: init.signal,
-    instructions: `${tutorInstructions(course)}\nTạo MỘT buổi học tập trung gồm 3–6 phần nhỏ và 3 câu trắc nghiệm. Mỗi phần có giải thích từ 120–250 từ, ví dụ cụ thể, và câu hỏi gợi mở ở cuối. Thời lượng 10–30 phút. Chỉ dùng kiến thức được chứng minh bởi trích đoạn nguồn để thiết kế nội dung và đáp án. Khi mục tiêu không có trong nguồn, giải thích phạm vi nguồn trong summary. sourceRefs phải dùng đúng materialId, index và label có trong dữ liệu; ít nhất một tham chiếu mỗi phần. Mỗi quiz có đúng 4 options; correctIndex từ 0 đến 3. Không đưa Markdown phức tạp hay HTML. Nếu học liệu bao phủ nhiều chương, chọn một phần có nền tảng phù hợp; không khẳng định bao phủ toàn bộ tài liệu.`,
-    messages: [{ role: "user", content: `Chủ đề muốn học: ${data.topic || "Bắt đầu từ khái niệm nền tảng trong các trích đoạn"}\n\n${sources.text}` }],
+    instructions: `${tutorInstructions(course)}\nTạo MỘT buổi học tập trung gồm 3–6 phần nhỏ và 3 câu trắc nghiệm. Mỗi phần có giải thích từ 120–250 từ, ví dụ cụ thể, và câu hỏi gợi mở ở cuối. Thời lượng 10–30 phút. Chỉ dùng kiến thức được chứng minh bởi trích đoạn nguồn để thiết kế nội dung và đáp án. Khi mục tiêu không có trong nguồn, giải thích phạm vi nguồn trong summary. sourceRefs phải dùng đúng materialId, index và label có trong dữ liệu; ít nhất một tham chiếu mỗi phần. Mỗi quiz có đúng 4 options; correctIndex từ 0 đến 3. Không đưa Markdown phức tạp hay HTML. Nếu học liệu bao phủ nhiều chương, chọn một phần có nền tảng phù hợp; không khẳng định bao phủ toàn bộ tài liệu. Hình gửi kèm là học liệu cần đọc: giải thích hình liên quan trong explanation, mô tả bộ phận, ký hiệu, trục, đơn vị và quan hệ/chiều chuyển động; phân biệt điều quan sát được với suy luận. Không bịa chi tiết quá nhỏ hoặc không rõ. Mỗi phần kiến thức cần một illustration dạng sơ đồ khái niệm có 2–10 nút và các mối liên hệ mang nhãn cụ thể; chỉ dùng null khi sơ đồ không giúp học. Đây là sơ đồ để giải thích khái niệm, không thay thế hình mạch chính xác. description phải hướng dẫn học viên đọc sơ đồ và liên hệ từng nút/chiều mũi tên với kiến thức. Node id phải duy nhất, from/to phải tồn tại trong nodes.`,
+    messages: [{ role: "user", content: `Chủ đề muốn học: ${data.topic || "Bắt đầu từ khái niệm nền tảng trong các trích đoạn"}\n\n${sources.text}`, images: sources.images }],
     schemaName: "tutor_lesson", schema: lessonJsonSchema,
   });
   let content;
@@ -169,30 +179,56 @@ async function chat(storage: BrowserStorage, init: RequestInit) {
   rateLimit("chat", 15);
   const result = await generateTutorText(storage, {
     maxOutputTokens: 4000, signal: init.signal,
-    instructions: `${tutorInstructions(course)}\nTrả lời trực tiếp câu hỏi của học viên bằng 80–250 từ. Học viên đang học phần '${lesson.segments[data.segmentIndex].title}' của bài '${lesson.title}'. Nếu chưa hiểu, giảng lại bằng cách khác và ví dụ, rồi hỏi một câu ngắn. sourceRefs chỉ trích nguồn đã cung cấp. Nếu không có nguồn cho câu trả lời hoặc đang hỏi ý kiến/làm rõ câu hỏi, dùng sourceRefs rỗng và nói rõ kiến thức bổ sung khi cần.\n\nHỌC LIỆU:\n${sources.text}`,
-    messages: [...history.map(item => ({ role: item.role, content: item.content.slice(0, 7000) })), { role: "user", content: data.message }],
+    instructions: `${tutorInstructions(course)}\nTrả lời trực tiếp câu hỏi của học viên bằng 80–250 từ. Học viên đang học phần '${lesson.segments[data.segmentIndex].title}' của bài '${lesson.title}'. Nếu chưa hiểu, giảng lại bằng cách khác và ví dụ, rồi hỏi một câu ngắn. sourceRefs chỉ trích nguồn đã cung cấp. Nếu không có nguồn cho câu trả lời hoặc đang hỏi ý kiến/làm rõ câu hỏi, dùng sourceRefs rỗng và nói rõ kiến thức bổ sung khi cần. Khi hỏi về hình, đọc và giải thích hình gửi kèm: bộ phận, ký hiệu, trục, đơn vị, quan hệ; nói rõ nếu hình mờ hoặc chưa được gửi. Khi học viên yêu cầu hình/sơ đồ hoặc chưa hiểu khái niệm, trả illustration gồm 2–10 nút, các cạnh có nhãn và description giải thích cụ thể cách đọc; các id phải hợp lệ. Khi không cần sơ đồ, trả illustration=null.\n\nHỌC LIỆU:\n${sources.text}`,
+    messages: [...history.map(item => ({ role: item.role, content: item.content.slice(0, 7000) })), { role: "user", content: data.message, images: sources.images }],
     schemaName: "tutor_answer", schema: chatJsonSchema,
   });
   let answer;
-  try { answer = z.object({ content: z.string().min(1).max(14000), sourceRefs: z.array(sourceRefSchema).max(8) }).parse(JSON.parse(result)); }
+  try { answer = z.object({ content: z.string().min(1).max(14000), sourceRefs: z.array(sourceRefSchema).max(8), illustration: illustrationSchema.nullable().optional() }).parse(JSON.parse(result)); }
   catch { throw new ClientApiError(502, "Gia sư chưa trả lời đầy đủ. Hãy thử hỏi lại."); }
   init.signal?.throwIfAborted();
   const createdAt = new Date().toISOString();
-  const response: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: answer.content, sourceRefs: canonicalRefs(answer.sourceRefs, sources.refs), createdAt: new Date(Date.now() + 1).toISOString() };
+  const response: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: answer.content, illustration: answer.illustration, sourceRefs: canonicalRefs(answer.sourceRefs, sources.refs), createdAt: new Date(Date.now() + 1).toISOString() };
   await storage.addMessages(course.id, [{ id: crypto.randomUUID(), role: "user", content: data.message, sourceRefs: [], createdAt }, response], lesson.id);
   return json(response);
 }
 
-async function voiceSession(storage: BrowserStorage, init: RequestInit) {
+async function prepareVoiceContext(storage: BrowserStorage, init: RequestInit) {
   const data = z.object({ lessonId: idSchema, segmentIndex: z.number().int().min(0).max(7) }).parse(body(init));
   const lesson = await lessonOrThrow(storage, data.lessonId); checkSegment(lesson, data.segmentIndex);
   const course = await courseOrThrow(storage, lesson.courseId);
   const sources = await collectSources(storage, lesson.materialIds, lesson.segments[data.segmentIndex].title, 8000);
   const history = (await storage.listMessages(course.id, lesson.id)).slice(-2);
-  await getAiConfig(storage);
-  rateLimit("voice", 4);
-  const instructions = `${tutorInstructions(course)}\nNói tiếng Việt tự nhiên, tốc độ vừa phải. Giảng mỗi lượt 45–90 giây rồi dừng hỏi học viên. Dừng và lắng nghe khi học viên ngắt lời. Giải thích lại nếu chưa hiểu; tiếp tục phần hiện tại khi họ muốn. Không tự đọc liên tục hết bài; không tự chuyển phần.\nBài đang học: ${lesson.title}; phần ${data.segmentIndex + 1}.\nCác phần trong bài: ${lesson.segments.map((segment, i) => `${i + 1}. ${segment.title}`).join("; ")}\nPHẦN HIỆN TẠI:\n${lesson.segments[data.segmentIndex].explanation.slice(0, 4500)}\n\nBẢN GHI TRƯỚC:\n${history.map(item => `${item.role}: ${item.content.slice(0, 500)}`).join("\n")}\n\nNGUỒN:\n${sources.text}`.slice(0, 18000);
-  return json(await createVoiceSession(storage, instructions, init.signal));
+  const segment = lesson.segments[data.segmentIndex];
+  const visualContext: { dataUrl: string; label: string }[] = []; let imageBytes = 0;
+  for (const ref of segment.sourceRefs) {
+    const material = await materialOrThrow(storage, ref.materialId);
+    if (material.courseId !== course.id || !lesson.materialIds.includes(material.id)) continue;
+    const unit = material.units.find(unit => unit.index === ref.index);
+    for (const image of unit?.images || []) {
+      if (visualContext.length >= 8 || imageBytes + image.dataUrl.length > 1200000) continue;
+      visualContext.push({ dataUrl: image.dataUrl, label: `${material.name} — ${unit!.label}: ${image.label}` });
+      imageBytes += image.dataUrl.length;
+    }
+  }
+  const instructions = `${tutorInstructions(course)}\nNói tiếng Việt tự nhiên, tốc độ vừa phải. Giảng mỗi lượt 45–90 giây rồi dừng hỏi học viên. Dừng và lắng nghe khi học viên ngắt lời. Giải thích lại nếu chưa hiểu; tiếp tục phần hiện tại khi họ muốn. Không tự đọc liên tục hết bài; không tự chuyển phần. Giải thích hình nguồn được gửi kèm: gọi đúng nhãn, bộ phận, ý nghĩa trục/đơn vị và các quan hệ. Nếu không rõ chi tiết thì nói rõ. Hướng dẫn học viên nhìn sơ đồ minh họa đang hiển thị và giải thích từng nút, mũi tên theo mô tả.\nBài đang học: ${lesson.title}; phần ${data.segmentIndex + 1}.\nCác phần trong bài: ${lesson.segments.map((segment, i) => `${i + 1}. ${segment.title}`).join("; ")}\nPHẦN HIỆN TẠI:\n${segment.explanation.slice(0, 4500)}\n${segment.illustration ? `SƠ ĐỒ HIỂN THỊ: ${segment.illustration.title}\n${segment.illustration.description}\nCác nút: ${segment.illustration.nodes.map(node => `${node.id}: ${node.label}`).join("; ")}\nMũi tên: ${segment.illustration.edges.map(edge => `${edge.from} -> ${edge.to}: ${edge.label}`).join("; ")}` : ""}\n\nBẢN GHI TRƯỚC:\n${history.map(item => `${item.role}: ${item.content.slice(0, 500)}`).join("\n")}\n\nNGUỒN:\n${sources.text}`.slice(0, 18000);
+  return { instructions, visualContext };
+}
+
+async function voiceSession(storage: BrowserStorage, init: RequestInit) {
+  await getAiConfig(storage); rateLimit("voice", 4);
+  const context = await prepareVoiceContext(storage, init);
+  return json({ ...await createVoiceSession(storage, context.instructions, init.signal), ...context });
+}
+
+async function testAiConnection(storage: BrowserStorage, init: RequestInit) {
+  const config = await getAiConfig(storage); rateLimit("ai-test", 3);
+  const result = await generateTutorText(storage, {
+    instructions: "Trả JSON theo cấu trúc, trường ok bằng true.", messages: [{ role: "user", content: "Kiểm tra kết nối gia sư, chỉ trả ok=true." }],
+    schemaName: "connection_test", schema: { type: "object", additionalProperties: false, properties: { ok: { type: "boolean" } }, required: ["ok"] }, maxOutputTokens: 1000, signal: init.signal,
+  });
+  if (JSON.parse(result).ok !== true) throw new ClientApiError(502, "AI chưa trả lời đúng yêu cầu kiểm tra.");
+  return json({ provider: config.provider, textModel: config.textModel, message: `Đã kết nối ${config.provider === "gemini" ? "Gemini" : "OpenAI"} với model ${config.textModel}. Giọng nói cần kiểm tra riêng khi bắt đầu buổi học và cấp quyền micro.` });
 }
 
 async function transcript(storage: BrowserStorage, init: RequestInit) {
@@ -244,6 +280,7 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
       return json(settings);
     }
     if (route === "/api/ai-settings" && ["GET", "PUT"].includes(method)) return await aiSettings(storage, init, method);
+    if (route === "/api/ai/test" && method === "POST") return await testAiConnection(storage, init);
     if (route === "/api/materials" && method === "POST") return await uploadMaterial(storage, init);
     const materialRoute = route.match(/^\/api\/materials\/([^/]+)(\/file)?$/);
     if (materialRoute) {
@@ -266,6 +303,7 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
       return json(await storage.saveProgress(lesson.courseId, progress));
     }
     if (route === "/api/voice/session" && method === "POST") return await voiceSession(storage, init);
+    if (route === "/api/voice/context" && method === "POST") return json(await prepareVoiceContext(storage, init));
     if (route === "/api/voice/transcript" && method === "POST") return await transcript(storage, init);
     throw new ClientApiError(404, "Không tìm thấy thao tác.");
   } catch (error) {
