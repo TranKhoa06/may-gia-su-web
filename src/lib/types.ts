@@ -1,0 +1,14 @@
+export type SourceRef = { materialId: string; index: number; label: string };
+export type SourceUnit = { index: number; label: string; text: string };
+export type Settings = { subject: string; level: string; goal: string; notebookUrl: string };
+export type Course = Settings & { id: string; createdAt: string };
+export type Material = { id: string; name: string; type: "pdf" | "pptx"; unitCount: number; characters: number; createdAt: string };
+export type Segment = { title: string; explanation: string; sourceRefs: SourceRef[] };
+export type Quiz = { question: string; options: string[]; correctIndex: number; explanation: string };
+export type Lesson = { id: string; title: string; summary: string; durationMinutes: number; materialIds: string[]; segments: Segment[]; quiz: Quiz[]; createdAt: string };
+export type Progress = { lessonId: string; segmentIndex: number; completed: boolean; score?: number; updatedAt: string };
+export type ChatMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string; sourceRefs?: SourceRef[] };
+export type AiProvider = "openai" | "gemini";
+export type AiPreferences = { provider: "auto" | AiProvider; openaiTextModel: string; openaiVoiceModel: string; geminiTextModel: string; geminiVoiceModel: string };
+export type AiSettingsState = { preferences: AiPreferences; selectedProvider: AiProvider; providers: { id: AiProvider; label: string; keyConfigured: boolean; textModels: { id: string; label: string }[]; voiceModels: { id: string; label: string }[] }[] };
+export type AppState = { courses: Course[]; activeCourseId: string; settings: Settings; materials: Material[]; lessons: Lesson[]; progress: Progress[]; aiReady: boolean; voiceReady: boolean; aiProvider: AiProvider | null; aiSettings: AiSettingsState };
