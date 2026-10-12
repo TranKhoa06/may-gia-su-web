@@ -1,8 +1,26 @@
 import type { Part } from "@google/genai";
 import { apiFetch } from "./client-api";
+import type { Lesson } from "./types";
+import { getSegmentKeyPoints } from "./study-focus";
 
 export type VoiceVisual = { dataUrl: string; label: string };
 export type VoiceContext = { visualContext: VoiceVisual[]; instructions: string };
+
+export const VIETNAMESE_VOICE_GUIDANCE = "Luôn giảng và trả lời bằng tiếng Việt, kể cả khi học liệu hoặc lời nhận dạng có tiếng Anh hay tiếng Tây Ban Nha. Chỉ đổi ngôn ngữ nếu học viên yêu cầu rõ ràng. Thuật ngữ chuyên môn có thể giữ nguyên nhưng phải giải thích bằng tiếng Việt.";
+
+/** Exact point indices and source IDs let the provider guide the visible workspace. */
+export function voiceFocusInstructions(lesson: Lesson, segmentIndex: number): string {
+  const segment = lesson.segments[segmentIndex];
+  if (!segment) return VIETNAMESE_VOICE_GUIDANCE;
+  return [
+    VIETNAMESE_VOICE_GUIDANCE,
+    "Khi bắt đầu giải thích một ý hoặc hình, gọi set_study_focus để đánh dấu ý cần chú ý và trang/slide liên quan. Chỉ gọi khi trọng tâm thay đổi; không đọc tên công cụ, số chỉ mục hoặc mã nguồn cho học viên nghe.",
+    "pointIndex là chỉ mục bắt đầu từ 0 trong danh sách dưới đây. Dùng null nếu đang trao đổi ngoài các ý này. materialId và index phải thuộc nguồn của phần hiện tại, hoặc đều null nếu không cần mở nguồn. cue là một câu tiếng Việt ngắn cho biết học viên nên chú ý điều gì.",
+    `Các ý của phần hiện tại: ${JSON.stringify(getSegmentKeyPoints(segment).map((point, pointIndex) => ({ pointIndex, point })))}`,
+    `Nguồn được phép mở của phần hiện tại: ${JSON.stringify(segment.sourceRefs.map(ref => ({ materialId: ref.materialId, index: ref.index, label: ref.label })))}`,
+    "Không tự chuyển sang phần khác. Sau mỗi ý, đưa một ví dụ ngắn hoặc câu hỏi để học viên xác nhận đã hiểu.",
+  ].join("\n");
+}
 
 /** Accept only bounded, embedded source images; never let a source trigger a URL fetch. */
 export function normalizeVoiceVisuals(value: unknown): VoiceVisual[] {

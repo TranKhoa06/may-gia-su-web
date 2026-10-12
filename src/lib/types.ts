@@ -1,11 +1,13 @@
 export type SourceRef = { materialId: string; index: number; label: string };
+export type StudyFocus = { pointIndex: number | null; cue: string; sourceRef?: SourceRef };
+export type LiveTranscript = { role: "user" | "assistant"; text: string };
 export type SourceImage = { id: string; label: string; dataUrl: string; mimeType: "image/jpeg" | "image/png" | "image/webp"; width: number; height: number };
 export type SourceUnit = { index: number; label: string; text: string; images?: SourceImage[]; visualNotice?: string };
 export type Settings = { subject: string; level: string; goal: string; notebookUrl: string };
 export type Course = Settings & { id: string; createdAt: string };
 export type Material = { id: string; name: string; type: "pdf" | "pptx"; unitCount: number; characters: number; createdAt: string };
 export type LessonIllustration = { title: string; description: string; nodes: { id: string; label: string }[]; edges: { from: string; to: string; label: string }[] };
-export type Segment = { title: string; explanation: string; sourceRefs: SourceRef[]; illustration?: LessonIllustration | null };
+export type Segment = { title: string; explanation: string; sourceRefs: SourceRef[]; keyPoints?: string[]; illustration?: LessonIllustration | null };
 export type Quiz = { question: string; options: string[]; correctIndex: number; explanation: string };
 export type Lesson = { id: string; title: string; summary: string; durationMinutes: number; materialIds: string[]; segments: Segment[]; quiz: Quiz[]; createdAt: string };
 export type Progress = { lessonId: string; segmentIndex: number; completed: boolean; score?: number; updatedAt: string };

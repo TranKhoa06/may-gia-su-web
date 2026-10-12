@@ -37,6 +37,6 @@ export const illustrationSchema = z.object({
 });
 export const lessonContentSchema = z.object({
   title: z.string().min(1).max(180), summary: z.string().max(1000), durationMinutes: z.number().int().min(1).max(90),
-  segments: z.array(z.object({ title: z.string().min(1).max(180), explanation: z.string().min(20).max(7000), sourceRefs: z.array(sourceRefSchema).min(1).max(5), illustration: illustrationSchema.nullable().optional() })).min(1).max(8),
+  segments: z.array(z.object({ title: z.string().min(1).max(180), explanation: z.string().min(20).max(7000), sourceRefs: z.array(sourceRefSchema).min(1).max(5), keyPoints: z.array(z.string().trim().min(1).max(180)).min(1).max(5).optional(), illustration: illustrationSchema.nullable().optional() })).min(1).max(8),
   quiz: z.array(z.object({ question: z.string().min(1).max(1000), options: z.array(z.string().min(1).max(400)).length(4), correctIndex: z.number().int().min(0).max(3), explanation: z.string().max(1600) })).min(1).max(5),
 });

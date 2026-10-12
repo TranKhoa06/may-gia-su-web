@@ -2,16 +2,19 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from "@google/genai";
-import type { ChatMessage, Lesson } from "./types";
+import type { ChatMessage, Lesson, LiveTranscript, StudyFocus } from "./types";
 import { apiFetch } from "./client-api";
 import { base64ToBytes, bytesToBase64, PCM_WORKLET_SOURCE, pcm16ToFloat32 } from "./gemini-audio";
-import { geminiVisualParts, loadVoiceContext, normalizeVoiceVisuals, type VoiceContext } from "./voice-context";
+import { geminiVisualParts, loadVoiceContext, normalizeVoiceVisuals, VIETNAMESE_VOICE_GUIDANCE, voiceFocusInstructions, type VoiceContext } from "./voice-context";
+import { parseStudyFocus } from "./study-focus";
 
 export type GeminiVoiceTutorOptions = {
   lesson: Lesson | null;
   segmentIndex: number;
   onMessage: (message: ChatMessage) => void;
   onSegmentChange?: (index: number) => void;
+  onFocus?: (focus: StudyFocus | null) => void;
+  onLiveTranscript?: (transcript: LiveTranscript | null) => void;
   onError: (message: string) => void;
 };
 
@@ -39,12 +42,17 @@ type GeminiSession = {
   context: VoiceContext;
   contextSegment: number;
   requestVersion: number;
+  toolIds: Set<string>;
+  cancelledTools: Set<string>;
+  focusCallId: string | null;
+  interrupted: boolean;
 };
 
 function teachingRequest(lesson: Lesson, index: number) {
   const segment = lesson.segments[index];
   return [
     "Hãy tiếp tục làm gia sư theo hướng dẫn của phiên học. Giảng bằng tiếng Việt.",
+    voiceFocusInstructions(lesson, index),
     `Bài học: ${lesson.title}. Phần ${index + 1}/${lesson.segments.length}: ${segment?.title || lesson.title}.`,
     `Nội dung phần này: ${segment?.explanation || ""}`,
     segment?.illustration?.description ? `Sơ đồ minh họa đang hiển thị cho học viên: ${segment.illustration.description}. Giải thích các thành phần và mối liên hệ trong sơ đồ.` : "",
@@ -62,6 +70,14 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
   const active = useRef<GeminiSession | null>(null);
   const mounted = useRef(true);
   latest.current = options;
+
+  const clearGuidance = useCallback((session?: GeminiSession | null) => {
+    if (session) session.focusCallId = null;
+    if (mounted.current) {
+      latest.current.onLiveTranscript?.(null);
+      latest.current.onFocus?.(null);
+    }
+  }, []);
 
   const persist = useCallback((session: GeminiSession, role: "user" | "assistant", transcript: Transcript | null) => {
     const content = transcript?.text.trim().slice(0, 20000);
@@ -105,6 +121,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     if (session) {
       // Flush while this lesson is still visible. The caller clears its UI afterwards.
       flush(session, "user"); flush(session, "assistant");
+      clearGuidance(session);
       session.abort.abort();
       if (session.timer) clearTimeout(session.timer);
       session.live?.close();
@@ -117,7 +134,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       if (session.workletUrl) URL.revokeObjectURL(session.workletUrl);
     }
     if (mounted.current) { setConnected(false); setConnecting(false); setSpeaking(false); setMuted(false); }
-  }, [clearPlayback, flush]);
+  }, [clearGuidance, clearPlayback, flush]);
 
   useEffect(() => {
     mounted.current = true;
@@ -126,6 +143,15 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
   useEffect(() => {
     if (active.current && active.current.lessonId !== options.lesson?.id) stop();
   }, [options.lesson?.id, stop]);
+
+  useEffect(() => {
+    const session = active.current;
+    if (!session || session.contextSegment === options.segmentIndex) return;
+    ++session.requestVersion;
+    clearPlayback(session);
+    flush(session, "user"); flush(session, "assistant");
+    clearGuidance(session);
+  }, [options.segmentIndex, clearGuidance, clearPlayback, flush]);
 
   const resumeAudio = useCallback(async (session: GeminiSession) => {
     try {
@@ -190,6 +216,8 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       outputs: new Set(), nextPlaybackTime: 0, muted: false, input: null, output: null,
       inputStartedAt: null, outputStartedAt: null, transcriptIds: new Set(), playbackWarning: false,
       context: { visualContext: [], instructions: "" }, contextSegment: segmentIndex, requestVersion: 0,
+      toolIds: new Set(), cancelledTools: new Set(), focusCallId: null,
+      interrupted: false,
     };
     active.current = session; setConnecting(true); setMuted(false);
     const fail = (message: string) => {
@@ -201,6 +229,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       if (text) {
         session[field] ||= { id: `gemini-${role}-${crypto.randomUUID()}`, text: "", createdAt: (role === "user" ? session.inputStartedAt : session.outputStartedAt) || new Date().toISOString() };
         session[field]!.text = (session[field]!.text + text).slice(0, 20000);
+        latest.current.onLiveTranscript?.({ role, text: session[field]!.text });
       }
       if (finished) flush(session, role);
     };
@@ -209,18 +238,49 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
       if (message.voiceActivity?.voiceActivityType === "ACTIVITY_START") session.inputStartedAt ||= new Date().toISOString();
       if (message.goAway) latest.current.onError("Phiên giọng nói sắp hết thời gian. Kết nối lại khi phiên dừng để tiếp tục bài học.");
       const content = message.serverContent;
-      if (!content) return;
+      for (const id of (message.toolCallCancellation?.ids || []).slice(0, 32)) {
+        if (session.cancelledTools.size >= 512) session.cancelledTools.delete(session.cancelledTools.values().next().value!);
+        session.cancelledTools.add(id);
+        if (session.focusCallId === id) {
+          session.focusCallId = null;
+          latest.current.onFocus?.(null);
+        }
+      }
+      if (content?.interrupted) { session.interrupted = true; clearPlayback(session); flush(session, "assistant"); clearGuidance(session); }
+      const contextCurrent = latest.current.lesson?.id === session.lessonId && latest.current.segmentIndex === session.contextSegment;
+      const functionResponses = [];
+      const focusUpdates: { callId: string; focus: StudyFocus }[] = [];
+      for (const call of (message.toolCall?.functionCalls || []).slice(0, 16)) {
+        if (!call.id || call.id.length > 256 || session.toolIds.has(call.id) || session.cancelledTools.has(call.id)) continue;
+        if (session.toolIds.size >= 512) session.toolIds.delete(session.toolIds.values().next().value!);
+        session.toolIds.add(call.id);
+        const focus = contextCurrent && !session.interrupted && call.name === "set_study_focus" && latest.current.lesson
+          ? parseStudyFocus(call.args, latest.current.lesson, session.contextSegment) : null;
+        const response = focus ? { result: "ok" } : { error: "invalid_or_stale_study_focus", guidance: "Dùng ý và nguồn của phần hiện tại. Tiếp tục giảng bằng tiếng Việt." };
+        functionResponses.push({ id: call.id, name: call.name || "set_study_focus", response });
+        if (focus) focusUpdates.push({ callId: call.id, focus });
+      }
+      if (functionResponses.length && session.live) {
+        try {
+          session.live.sendToolResponse({ functionResponses });
+          for (const update of focusUpdates) {
+            session.focusCallId = update.callId;
+            latest.current.onFocus?.(update.focus);
+          }
+        }
+        catch { latest.current.onError("Chưa cập nhật được trọng tâm bài giảng. Hãy kết nối lại phiên giọng nói."); }
+      }
+      if (!content || !contextCurrent) return;
       appendTranscript("user", content.inputTranscription?.text, content.inputTranscription?.finished);
-      appendTranscript("assistant", content.outputTranscription?.text, content.outputTranscription?.finished);
-      if (content.interrupted) { clearPlayback(session); flush(session, "assistant"); }
-      for (const part of content.interrupted ? [] : content.modelTurn?.parts || []) {
+      if (!session.interrupted) appendTranscript("assistant", content.outputTranscription?.text, content.outputTranscription?.finished);
+      for (const part of session.interrupted ? [] : content.modelTurn?.parts || []) {
         if (part.inlineData?.data && part.inlineData.mimeType?.startsWith("audio/pcm")) {
           session.outputStartedAt ||= new Date().toISOString();
           try { queueAudio(session, part.inlineData.data); }
           catch { fail("Chưa phát được âm thanh của gia sư. Hãy kết nối lại phiên giọng nói."); return; }
         }
       }
-      if (content.turnComplete) { flush(session, "user"); flush(session, "assistant"); }
+      if (content.turnComplete) { flush(session, "user"); flush(session, "assistant"); session.interrupted = false; }
     };
     try {
       await resumeAudio(session);
@@ -280,7 +340,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
           : /^(Chưa |Cấu hình |Dịch vụ |Hãy |Khóa |Model |OpenAI |Gemini )/.test(message) ? message
             : "Chưa kết nối được Gemini Live. Hãy kiểm tra khóa API, quyền model và kết nối mạng.");
     }
-  }, [clearPlayback, flush, queueAudio, refreshContext, resumeAudio, stop]);
+  }, [clearGuidance, clearPlayback, flush, queueAudio, refreshContext, resumeAudio, stop]);
 
   const toggleMute = useCallback(() => {
     const session = active.current; if (!session?.microphone || !session.live) return;
@@ -304,7 +364,7 @@ export function useGeminiVoiceTutor(options: GeminiVoiceTutorOptions) {
     try {
       if (!await refreshContext(session, latest.current.segmentIndex, requestVersion)) return;
       if (active.current !== session || session.requestVersion !== requestVersion) return;
-      session.live.sendClientContent({ turns: [{ role: "user", parts: [{ text: content }] }], turnComplete: true });
+      session.live.sendClientContent({ turns: [{ role: "user", parts: [{ text: `${VIETNAMESE_VOICE_GUIDANCE}\nCâu hỏi của học viên: ${content}` }] }], turnComplete: true });
       persist(session, "user", { id: `gemini-user-${crypto.randomUUID()}`, text: content, createdAt: new Date().toISOString() });
     } catch { latest.current.onError("Chưa gửi được câu hỏi. Hãy kết nối lại phiên giọng nói."); }
   }, [clearPlayback, flush, persist, refreshContext, resumeAudio]);

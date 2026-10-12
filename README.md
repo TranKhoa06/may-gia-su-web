@@ -11,6 +11,14 @@ Mây là web tĩnh chạy trên GitHub Pages. Bạn mở bằng trình duyệt t
 3. Chọn cấu hình **Giảng bài và hỏi đáp** và **Trò chuyện giọng nói** độc lập. Ví dụ dùng Gemini để tạo bài giảng và OpenAI để trò chuyện. Có thể chọn hai khóa khác nhau của cùng dịch vụ. Tạo môn học, tải PDF hoặc PPTX trong **Thư viện**, chọn học liệu và bấm **Tạo bài học cho tôi**. Trong lớp học/thư viện, đổi cấu hình rồi bấm **Áp dụng lựa chọn**.
 4. Mở bài học rồi chọn **Trò chuyện bằng giọng nói**, cho phép micro. Bạn có thể ngắt lời, hỏi lại và yêu cầu giảng tiếp từng phần.
 
+## Theo dõi và hỏi trong buổi học
+
+Mục lục hiển thị tên từng phần. **Bài giảng**, **Hỏi đáp**, **Luyện tập** có khung cuộn riêng; ô hỏi nằm ở tab **Hỏi đáp**, Enter gửi và Shift+Enter xuống dòng. Khi bạn đọc tin cũ, chat không tự kéo xuống; bấm **Tin nhắn mới** để quay về cuối.
+
+Thanh **Đang học / Cần chú ý** giữ tên phần và các ý chính. Với AI giọng nói, gia sư dùng công cụ để báo ý/trang nguồn đang giải thích. Web chỉ chấp nhận nguồn và ý thuộc phần hiện tại; nếu gia sư chưa báo thì ghi rõ chưa có vị trí. **Theo gia sư** chuyển sang nguồn đã được báo; duyệt trang thủ công sẽ tắt chế độ theo, và bạn có thể bật lại. Các nút **Tôi đang ở đâu?**, **Chỉ giúp tôi phần cần nhìn**, **Giảng lại ý này** giúp yêu cầu định hướng lại.
+
+Lời giảng được ghi lại trực tiếp nhưng chữ có thể xuất hiện trước tiếng nói. Điểm chú ý do model chọn, không phải đồng bộ chính xác từng từ với âm thanh. Với giọng đọc của trình duyệt, web chỉ đánh dấu đoạn khi có sự kiện vị trí đọc; nếu giọng đọc không báo vị trí thì không giả lập tiến độ. Khi chuyển phần, phiên giọng nói cũ dừng để tránh tiếp tục nói về phần cũ; bấm **Trò chuyện bằng giọng nói** để bắt đầu phần mới. Bài học đã lưu vẫn dùng được, các ý chính của bài cũ được lấy từ lời giải thích có sẵn.
+
 Hạn mức và phí API phụ thuộc tài khoản Gemini/OpenAI của bạn. GitHub Pages chỉ phục vụ mã và tài nguyên web.
 
 ## Dữ liệu cá nhân

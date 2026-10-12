@@ -2,6 +2,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { z } from "zod";
 import type { AiPreferences, AiProvider, AiSettingsState, SourceImage } from "./types";
 import type { BrowserStorage } from "./browser-storage";
+import { studyFocusTool } from "./study-focus";
 
 /** All credentials come from this browser's private profile, never the published bundle. */
 export class BrowserAiError extends Error {
@@ -170,7 +171,8 @@ export async function createVoiceSession(storage: BrowserStorage, instructions: 
         uses: 1, expireTime: new Date(now + 30 * 60 * 1000).toISOString(), newSessionExpireTime: new Date(now + 60000).toISOString(),
         abortSignal: combinedSignal(signal, 25000), liveConnectConstraints: { model: config.voiceModel, config: {
           responseModalities: [Modality.AUDIO], maxOutputTokens: 1500, systemInstruction: instructions,
-          inputAudioTranscription: {}, outputAudioTranscription: {},
+          tools: [{ functionDeclarations: [{ name: studyFocusTool.name, description: studyFocusTool.description, parametersJsonSchema: studyFocusTool.parameters }] }],
+          inputAudioTranscription: { languageCodes: ["vi-VN"] }, outputAudioTranscription: { languageCodes: ["vi-VN"] },
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
           realtimeInputConfig: { automaticActivityDetection: { disabled: false, prefixPaddingMs: 150, silenceDurationMs: 700 } },
         } },
@@ -189,6 +191,7 @@ export async function createVoiceSession(storage: BrowserStorage, instructions: 
     method: "POST", headers: { Authorization: `Bearer ${config.key}`, "Content-Type": "application/json" }, signal: combinedSignal(signal, 25000),
     body: JSON.stringify({ expires_after: { anchor: "created_at", seconds: 60 }, session: {
       type: "realtime", model: config.voiceModel, output_modalities: ["audio"], max_output_tokens: 1500, instructions,
+      tools: [{ type: "function", ...studyFocusTool }], tool_choice: "auto",
       audio: { input: { noise_reduction: { type: "near_field" }, transcription: { model: "gpt-4o-mini-transcribe", language: "vi" }, turn_detection: { type: "semantic_vad", eagerness: "low", create_response: true, interrupt_response: true } }, output: { voice: "marin" } },
     } }),
   }, fetchImplementation);

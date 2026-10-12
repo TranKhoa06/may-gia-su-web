@@ -14,7 +14,7 @@ export const lessonJsonSchema = {
   type: "object", additionalProperties: false,
   properties: {
     title: string, summary: string, durationMinutes: { type: "integer" },
-    segments: { type: "array", items: { type: "object", additionalProperties: false, properties: { title: string, explanation: string, sourceRefs: { type: "array", items: ref }, illustration: illustrationJsonSchema }, required: ["title", "explanation", "sourceRefs", "illustration"] } },
+    segments: { type: "array", items: { type: "object", additionalProperties: false, properties: { title: string, explanation: string, sourceRefs: { type: "array", items: ref }, keyPoints: { type: "array", minItems: 1, maxItems: 5, items: { type: "string", minLength: 1, maxLength: 180 } }, illustration: illustrationJsonSchema }, required: ["title", "explanation", "sourceRefs", "keyPoints", "illustration"] } },
     quiz: { type: "array", items: { type: "object", additionalProperties: false, properties: { question: string, options: { type: "array", items: string }, correctIndex: { type: "integer" }, explanation: string }, required: ["question", "options", "correctIndex", "explanation"] } },
   }, required: ["title", "summary", "durationMinutes", "segments", "quiz"],
 };

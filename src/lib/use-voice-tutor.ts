@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChatMessage, Lesson } from "./types";
+import type { ChatMessage, Lesson, LiveTranscript, StudyFocus } from "./types";
 import { apiFetch } from "./client-api";
 import { useGeminiVoiceTutor } from "./use-gemini-voice-tutor";
-import { fitOpenAiVoiceVisual, loadVoiceContext, normalizeVoiceVisuals, openAiVisualEvent, type VoiceContext } from "./voice-context";
+import { fitOpenAiVoiceVisual, loadVoiceContext, normalizeVoiceVisuals, openAiVisualEvent, VIETNAMESE_VOICE_GUIDANCE, voiceFocusInstructions, type VoiceContext } from "./voice-context";
+import { parseStudyFocus } from "./study-focus";
 
 type VoiceTutorOptions = {
   provider?: "gemini" | "openai";
@@ -12,6 +13,8 @@ type VoiceTutorOptions = {
   segmentIndex: number;
   onMessage: (message: ChatMessage) => void;
   onSegmentChange?: (index: number) => void;
+  onFocus?: (focus: StudyFocus | null) => void;
+  onLiveTranscript?: (transcript: LiveTranscript | null) => void;
   onError: (message: string) => void;
 };
 
@@ -33,23 +36,37 @@ type VoiceSession = {
   context: VoiceContext;
   contextSegment: number;
   requestVersion: number;
+  partialTranscripts: Map<string, string>;
+  responseContexts: Map<string, ResponseContext>;
+  pendingTools: Map<string, FocusToolCall>;
+  toolIds: Set<string>;
+  finishedResponses: Set<string>;
 };
 
+type ResponseContext = { segmentIndex: number; requestVersion: number };
+type FocusToolCall = { call_id: string; name: string; arguments: string; responseId: string; context: ResponseContext };
+type RealtimeOutputItem = { id?: string; type?: string; call_id?: string; name?: string; arguments?: string; status?: string };
 type RealtimeEvent = {
   type?: string;
   item_id?: string;
-  item?: { id?: string };
+  item?: RealtimeOutputItem;
   content_index?: number;
   transcript?: string;
   text?: string;
+  delta?: string;
+  response_id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
   error?: { code?: string };
-  response?: { status?: string };
+  response?: { id?: string; status?: string; output?: RealtimeOutputItem[] };
 };
 
 function teachingInstructions(lesson: Lesson, index: number): string {
   const segment = lesson.segments[index];
   return [
     "Tiếp tục làm gia sư theo hướng dẫn của phiên học. Giảng bằng tiếng Việt, rõ ràng và từng đoạn ngắn.",
+    voiceFocusInstructions(lesson, index),
     `Bài học: ${lesson.title}. Phần đang học: ${index + 1}/${lesson.segments.length}: ${segment?.title ?? lesson.title}.`,
     segment?.explanation ? `Nội dung phần này: ${segment.explanation}` : "",
     segment?.illustration?.description ? `Sơ đồ minh họa đang hiển thị cho học viên: ${segment.illustration.description}. Hãy giải thích các thành phần và mối liên hệ trong sơ đồ.` : "",
@@ -105,9 +122,18 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
 
   latest.current = options;
 
+  const clearGuidance = useCallback((session?: VoiceSession | null) => {
+    session?.partialTranscripts.clear();
+    if (mounted.current) {
+      latest.current.onLiveTranscript?.(null);
+      latest.current.onFocus?.(null);
+    }
+  }, []);
+
   const stop = useCallback(() => {
     const session = active.current;
     active.current = null;
+    if (session) clearGuidance(session);
     if (session) {
       session.abort.abort();
       if (session.timer) clearTimeout(session.timer);
@@ -135,7 +161,7 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       setSpeaking(false);
       setMuted(false);
     }
-  }, []);
+  }, [clearGuidance]);
 
   useEffect(() => {
     mounted.current = true;
@@ -148,6 +174,18 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
   useEffect(() => {
     if (active.current && active.current.lessonId !== options.lesson?.id) stop();
   }, [options.lesson?.id, stop]);
+
+  useEffect(() => {
+    const session = active.current;
+    if (!session || session.contextSegment === options.segmentIndex) return;
+    ++session.requestVersion;
+    session.pendingResponse = null;
+    clearGuidance(session);
+    if (session.responseActive && !session.cancelling) session.cancelling = sendEvent(session, { type: "response.cancel" });
+    sendEvent(session, { type: "output_audio_buffer.clear" });
+    session.playing = false;
+    setSpeaking(false);
+  }, [options.segmentIndex, clearGuidance]);
 
   const playAudio = useCallback((session: VoiceSession) => {
     if (!session.audio.srcObject) return;
@@ -243,6 +281,7 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       context: { visualContext: [], instructions: "" },
       contextSegment: segmentIndex,
       requestVersion: 0,
+      partialTranscripts: new Map(), responseContexts: new Map(), pendingTools: new Map(), toolIds: new Set(), finishedResponses: new Set(),
     };
     active.current = session;
     setConnecting(true);
@@ -277,6 +316,59 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       });
     };
 
+    const currentContext = (): ResponseContext => ({ segmentIndex: session.contextSegment, requestVersion: session.requestVersion });
+    const contextIsCurrent = (context: ResponseContext) => active.current === session
+      && latest.current.lesson?.id === session.lessonId
+      && latest.current.segmentIndex === context.segmentIndex
+      && session.contextSegment === context.segmentIndex
+      && session.requestVersion === context.requestVersion;
+    const caption = (role: ChatMessage["role"], event: RealtimeEvent, final?: string) => {
+      const context = event.response_id ? session.responseContexts.get(event.response_id) : currentContext();
+      if (!context || !contextIsCurrent(context)) return;
+      const key = `${role}:${event.item_id || "current"}:${event.content_index || 0}`;
+      if (!session.partialTranscripts.has(key) && session.partialTranscripts.size >= 32) session.partialTranscripts.delete(session.partialTranscripts.keys().next().value!);
+      const text = (final ?? `${session.partialTranscripts.get(key) || ""}${event.delta || ""}`).slice(0, 20000);
+      if (final !== undefined) session.partialTranscripts.delete(key);
+      else session.partialTranscripts.set(key, text);
+      if (text.trim()) latest.current.onLiveTranscript?.({ role, text });
+    };
+    const queueTool = (item: RealtimeOutputItem, responseId: string) => {
+      if (!item.call_id || item.call_id.length > 256 || typeof item.name !== "string" || typeof item.arguments !== "string" || session.toolIds.has(item.call_id)) return;
+      const context = session.responseContexts.get(responseId);
+      if (!context || session.pendingTools.size >= 32) return;
+      session.pendingTools.set(item.call_id, { call_id: item.call_id, name: item.name.slice(0, 100), arguments: item.arguments.length <= 4000 ? item.arguments : "", responseId, context });
+    };
+    const finishTools = (event: RealtimeEvent, cancelled: boolean) => {
+      const responseId = event.response?.id || event.response_id || "";
+      if (!responseId || session.finishedResponses.has(responseId)) return false;
+      if (session.finishedResponses.size >= 256) session.finishedResponses.delete(session.finishedResponses.values().next().value!);
+      session.finishedResponses.add(responseId);
+      for (const item of (event.response?.output || []).slice(0, 16)) {
+        if (item.type === "function_call") queueTool(item, responseId);
+      }
+      let acknowledged = false;
+      for (const call of [...session.pendingTools.values()]) {
+        if (call.responseId !== responseId) continue;
+        session.pendingTools.delete(call.call_id);
+        if (session.toolIds.has(call.call_id)) continue;
+        // Arguments-done also fires for cancelled/incomplete responses. Never move
+        // the visible source until the enclosing response has actually completed.
+        if (session.toolIds.size >= 512) session.toolIds.delete(session.toolIds.values().next().value!);
+        session.toolIds.add(call.call_id);
+        if (cancelled || event.response?.status !== "completed") continue;
+        let args: unknown;
+        try { args = JSON.parse(call.arguments); } catch { args = null; }
+        const focus = call.name === "set_study_focus" && contextIsCurrent(call.context) && latest.current.lesson
+          ? parseStudyFocus(args, latest.current.lesson, call.context.segmentIndex) : null;
+        const output = focus ? { result: "ok" } : { error: "invalid_or_stale_study_focus", guidance: "Dùng ý và nguồn của phần hiện tại, hoặc để các chỉ mục nguồn là null. Tiếp tục trả lời bằng tiếng Việt." };
+        if (sendEvent(session, { type: "conversation.item.create", item: { type: "function_call_output", call_id: call.call_id, output: JSON.stringify(output) } })) {
+          acknowledged = true;
+          if (focus) latest.current.onFocus?.(focus);
+        }
+      }
+      return acknowledged;
+    };
+
     session.channel.onopen = async () => {
       if (active.current !== session) return;
       if (session.timer) clearTimeout(session.timer);
@@ -302,14 +394,25 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
       let event: RealtimeEvent;
       try { event = JSON.parse(message.data) as RealtimeEvent; } catch { return; }
       switch (event.type) {
+        case "conversation.item.input_audio_transcription.delta":
+          caption("user", event);
+          break;
+        case "response.output_audio_transcript.delta":
+        case "response.audio_transcript.delta":
+        case "response.output_text.delta":
+          caption("assistant", event);
+          break;
         case "conversation.item.input_audio_transcription.completed":
+          if (event.transcript) caption("user", event, event.transcript);
           if (event.transcript) addTranscript("user", event.transcript, event.item_id, event.content_index);
           break;
         case "response.output_audio_transcript.done":
         case "response.audio_transcript.done":
+          if (event.transcript) caption("assistant", event, event.transcript);
           if (event.transcript) addTranscript("assistant", event.transcript, event.item_id, event.content_index);
           break;
         case "response.output_text.done":
+          if (event.text) caption("assistant", event, event.text);
           if (event.text) addTranscript("assistant", event.text, event.item_id, event.content_index);
           break;
         case "response.output_item.added":
@@ -317,6 +420,15 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
           break;
         case "response.created":
           session.responseActive = true;
+          if (event.response?.id) {
+            if (session.responseContexts.size >= 64) session.responseContexts.delete(session.responseContexts.keys().next().value!);
+            session.responseContexts.set(event.response.id, currentContext());
+          }
+          session.partialTranscripts.clear();
+          latest.current.onLiveTranscript?.(null);
+          break;
+        case "response.function_call_arguments.done":
+          if (!event.response_id || !session.finishedResponses.has(event.response_id)) queueTool({ call_id: event.call_id, name: event.name, arguments: event.arguments }, event.response_id || "");
           break;
         case "output_audio_buffer.started":
           session.playing = true;
@@ -324,21 +436,33 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
           playAudio(session);
           break;
         case "input_audio_buffer.speech_started":
+          ++session.requestVersion;
+          clearGuidance(session);
           if (event.item_id) session.itemTimes.set(event.item_id, new Date().toISOString());
           session.playing = false;
           setSpeaking(false);
           break;
         case "output_audio_buffer.cleared":
+          session.partialTranscripts.clear();
+          latest.current.onLiveTranscript?.(null);
+          session.playing = false;
+          setSpeaking(false);
+          break;
         case "output_audio_buffer.stopped":
           session.playing = false;
           setSpeaking(false);
           break;
         case "response.done": {
+          const responseId = event.response?.id || event.response_id;
+          if (responseId && session.finishedResponses.has(responseId)) break;
+          const cancelled = session.cancelling || session.pendingResponse !== null;
+          const toolsAcknowledged = finishTools(event, cancelled);
           session.responseActive = false;
           session.cancelling = false;
           const pending = session.pendingResponse;
           session.pendingResponse = null;
           if (pending !== null) createResponse(session, pending);
+          else if (toolsAcknowledged) createResponse(session);
           if (event.response?.status === "failed") latest.current.onError("Gia sư chưa trả lời được. Hãy thử hỏi lại.");
           break;
         }
@@ -434,7 +558,7 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
             ? code
             : "Chưa kết nối được gia sư bằng giọng nói. Hãy kiểm tra mạng và thử lại.");
     }
-  }, [playAudio, refreshContext, sendContext, stop]);
+  }, [clearGuidance, playAudio, refreshContext, sendContext, stop]);
 
   const toggleMute = useCallback(() => {
     const session = active.current;
@@ -465,7 +589,7 @@ function useOpenAIVoiceTutor(options: VoiceTutorOptions) {
     const itemId = crypto.randomUUID().replace(/-/g, "");
     const id = `voice-user-${itemId}`;
     const createdAt = new Date().toISOString();
-    if (!sendEvent(session, { type: "conversation.item.create", item: { id: itemId, type: "message", role: "user", content: [{ type: "input_text", text: content }] } })) {
+    if (!sendEvent(session, { type: "conversation.item.create", item: { id: itemId, type: "message", role: "user", content: [{ type: "input_text", text: `${VIETNAMESE_VOICE_GUIDANCE}\nCâu hỏi của học viên: ${content}` }] } })) {
       latest.current.onError("Chưa gửi được câu hỏi. Hãy kết nối lại phiên giọng nói.");
       return;
     }
