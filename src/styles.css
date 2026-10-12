@@ -1,6 +1,15 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "../vendor/shadcn-tailwind-4.13.0.css";
+.delete-modal { background:#fffefa; border:1px solid #e0e9d1; box-shadow:0 20px 70px #1d392a25; width:500px; max-width:100%; border-radius:20px; padding:34px; position:relative; text-align:center; max-height:calc(100vh - 48px); overflow-y:auto; }
+.delete-modal>.empty-icon { margin:0 auto 20px; background:#fcf0e9; color:#a45d45; }
+.delete-modal h2 { color:#426436; font-size:23px; font-weight:550; letter-spacing:-.7px; }
+.delete-modal>p { color:#5f7151; font-size:13px; line-height:1.8; margin-top:15px; }
+.delete-modal>.delete-material-name { color:#283f36; font-weight:600; overflow-wrap:anywhere; }
+.delete-modal-actions { display:flex; justify-content:center; gap:12px; margin-top:26px; flex-wrap:wrap; }
+.button.delete-confirm { background:#a65e46; color:white; }
+.button.delete-confirm:hover:not(:disabled) { background:#8e4d38; }
+@media(max-width:560px) { .delete-modal { padding:28px 22px; } }
 :root { --background:#faf9f6; --foreground:#283f36; --card:#fffefa; --card-foreground:#283f36; --primary:#286e60; --primary-foreground:#fff; --secondary:#f0f5ec; --secondary-foreground:#517447; --muted:#f0efe8; --muted-foreground:#84917b; --accent:#eaf1e5; --accent-foreground:#286e60; --border:#e5e8dc; --input:#dce2d2; --ring:#286e60; --radius:.7rem; --destructive:#b76b54; }
 @theme inline { --color-background:var(--background); --color-foreground:var(--foreground); --color-card:var(--card); --color-primary:var(--primary); --color-primary-foreground:var(--primary-foreground); --color-secondary:var(--secondary); --color-muted:var(--muted); --color-muted-foreground:var(--muted-foreground); --color-border:var(--border); --color-input:var(--input); --color-ring:var(--ring); --color-destructive:var(--destructive); --font-sans:"Segoe UI",Arial,Helvetica,sans-serif; --radius-sm:.4rem; --radius-md:.6rem; --radius-lg:.8rem; --radius-xl:1rem; }
 * { box-sizing:border-box; } html { scroll-behavior:smooth; } body { margin:0; background:var(--background); color:var(--foreground); font-family:"Segoe UI",Arial,Helvetica,sans-serif; font-size:14px; -webkit-font-smoothing:antialiased; } button,input,textarea,select { font:inherit; } button,a { -webkit-tap-highlight-color:transparent; } button { cursor:pointer; border:0; background:none; color:inherit; } button:disabled { cursor:not-allowed; opacity:.45; } button,a,input,textarea,select { outline-offset:4px; } :focus-visible { outline:2px solid #3d9081; } a { color:inherit; text-decoration:none; } h1,h2,h3,p { margin:0; } svg { flex-shrink:0; }
