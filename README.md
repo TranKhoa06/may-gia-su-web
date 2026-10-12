@@ -6,9 +6,9 @@ Mây là web tĩnh chạy trên GitHub Pages. Bạn mở bằng trình duyệt t
 
 ## Bắt đầu học
 
-1. Mở **Cài đặt**, chọn Google Gemini hoặc OpenAI và model muốn dùng.
-2. Nhập khóa API của dịch vụ bạn chọn rồi bấm **Lưu lựa chọn AI**. Khóa được lưu trong IndexedDB của trình duyệt; ứng dụng chỉ gửi khóa tới dịch vụ AI khi bạn sử dụng tính năng đó. Kho GitHub và bản web công khai không chứa khóa cá nhân.
-3. Tạo môn học, tải PDF hoặc PPTX trong **Thư viện**, chọn học liệu và bấm **Tạo bài học cho tôi**. Bạn có thể đổi model ngay trên trang lớp học/thư viện bằng **Áp dụng model**.
+1. Mở **Cài đặt**, bấm **Thêm cấu hình AI**, chọn Google Gemini hoặc OpenAI, đặt tên, nhập khóa và chọn model cho cấu hình đó. Có thể thêm nhiều cấu hình cùng một dịch vụ, tối đa 20 cấu hình.
+2. Để nhập nhanh, chọn **Dán nhiều khóa cùng lúc**, chọn dịch vụ rồi dán mỗi khóa trên một dòng. Bấm **Thêm các khóa**, chỉnh tên/model từng cấu hình và **Lưu các cấu hình AI**. Khóa được lưu trong IndexedDB của trình duyệt; ứng dụng chỉ gửi khóa tới dịch vụ tương ứng khi bạn sử dụng tính năng đó. Kho GitHub và bản web công khai không chứa khóa cá nhân.
+3. Chọn cấu hình **Giảng bài và hỏi đáp** và **Trò chuyện giọng nói** độc lập. Ví dụ dùng Gemini để tạo bài giảng và OpenAI để trò chuyện. Có thể chọn hai khóa khác nhau của cùng dịch vụ. Tạo môn học, tải PDF hoặc PPTX trong **Thư viện**, chọn học liệu và bấm **Tạo bài học cho tôi**. Trong lớp học/thư viện, đổi cấu hình rồi bấm **Áp dụng lựa chọn**.
 4. Mở bài học rồi chọn **Trò chuyện bằng giọng nói**, cho phép micro. Bạn có thể ngắt lời, hỏi lại và yêu cầu giảng tiếp từng phần.
 
 Hạn mức và phí API phụ thuộc tài khoản Gemini/OpenAI của bạn. GitHub Pages chỉ phục vụ mã và tài nguyên web.
@@ -23,7 +23,9 @@ Tổng hình lưu tối đa 10 MB/tài liệu; PPTX tối đa 6 hình/slide và 
 
 Link NotebookLM mở notebook Google ở tab riêng. Quyền đọc/chia sẻ của notebook cá nhân không nhập nội dung vào Mây. Tải cùng PDF/PPTX vào thư viện để gia sư này giảng; khóa Gemini không cấp quyền đọc NotebookLM. Không cần tài khoản ChatGPT để mở web.
 
-**Kiểm tra kết nối AI** trong cài đặt gửi một yêu cầu nhỏ tới model đã lưu. Có khóa chưa đảm bảo model dùng được: khóa cần quyền và hạn mức còn lại. Giọng nói cần trình duyệt hỗ trợ micro và WebRTC/AudioContext, quyền micro, model Live/Realtime khả dụng. Khóa của mỗi dịch vụ chỉ gửi tới endpoint chính thức của dịch vụ đó.
+**Kiểm tra cấu hình** trên mỗi thẻ gửi một yêu cầu nhỏ bằng đúng khóa và model của thẻ đó; không đổi lựa chọn đang học. Có khóa chưa đảm bảo model dùng được: khóa cần quyền và hạn mức còn lại. Giọng nói cần trình duyệt hỗ trợ micro và WebRTC/AudioContext, quyền micro, model Live/Realtime khả dụng. Khóa của mỗi dịch vụ chỉ gửi tới endpoint chính thức của dịch vụ đó.
+
+Khóa đã cấu hình trước đây tự chuyển thành thẻ có tên khi cập nhật. Ô mật khẩu đã lưu luôn để trống; sửa tên/model không cần dán lại khóa. Xóa một cấu hình có bước xác nhận và chỉ xóa thật khi bấm **Lưu các cấu hình AI**. Chọn chỉ dùng giọng đọc trình duyệt để tắt AI giọng nói mà vẫn giữ cấu hình hỏi đáp. Web dùng cấu hình bạn chọn, không tự xoay khóa hay đổi tài khoản khi hết hạn mức.
 
 ## Phát triển
 

@@ -1,4 +1,4 @@
-import type { AiPreferences, AiProvider, ChatMessage, Course, Lesson, Material, Progress, Settings, SourceUnit } from "./types";
+import type { AiPreferences, AiProfile, AiProfileSelection, AiProvider, ChatMessage, Course, Lesson, Material, Progress, Settings, SourceUnit } from "./types";
 
 const DATABASE_NAME = "may-gia-su-browser";
 const DATABASE_VERSION = 1;
@@ -11,6 +11,54 @@ export type StoredLesson = Lesson & { courseId: string };
 type StoredProgress = Progress & { courseId: string };
 type StoredMessage = ChatMessage & { courseId: string; lessonId?: string };
 type ConfigRecord = { key: string; value: unknown };
+export type StoredAiProfile = Omit<AiProfile, "keyConfigured">;
+export const LEGACY_PROFILE_IDS: Record<AiProvider, string> = { gemini: "00000000-0000-4000-8000-000000000001", openai: "00000000-0000-4000-8000-000000000002" };
+const fallbackAiPreferences = (): AiPreferences => ({ provider: "auto", openaiTextModel: "gpt-4.1", openaiVoiceModel: "gpt-realtime", geminiTextModel: "gemini-3.8-flash", geminiVoiceModel: "gemini-3.8-live" });
+const emptyAiSelection = (): AiProfileSelection => ({ textProfileId: null, voiceProfileId: null });
+const profileIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Pick the fields explicitly: metadata returned to the UI must never include a
+// private key or other properties accidentally included in an incoming object.
+function normalizeAiProfiles(profiles: StoredAiProfile[]): StoredAiProfile[] {
+  if (!Array.isArray(profiles) || profiles.length > 20) throw new BrowserStorageError("Chỉ lưu tối đa 20 cấu hình AI.", 400, "AI_PROFILE_INVALID");
+  const ids = new Set<string>();
+  return profiles.map(profile => {
+    if (!profile || !profileIdPattern.test(profile.id) || ids.has(profile.id) || !["openai", "gemini"].includes(profile.provider)
+      || typeof profile.label !== "string" || !profile.label.trim() || profile.label.trim().length > 120
+      || typeof profile.textModel !== "string" || !profile.textModel.trim() || profile.textModel.trim().length > 160
+      || (profile.voiceModel !== null && (typeof profile.voiceModel !== "string" || !profile.voiceModel.trim() || profile.voiceModel.trim().length > 160))) {
+      throw new BrowserStorageError("Cấu hình AI chưa hợp lệ hoặc có mã bị trùng.", 400, "AI_PROFILE_INVALID");
+    }
+    ids.add(profile.id);
+    return { id: profile.id, label: profile.label.trim(), provider: profile.provider, textModel: profile.textModel.trim(), voiceModel: profile.voiceModel?.trim() || null };
+  });
+}
+
+function validateAiSelection(selection: AiProfileSelection, profiles: StoredAiProfile[]): AiProfileSelection {
+  const text = profiles.find(profile => profile.id === selection?.textProfileId);
+  const voice = profiles.find(profile => profile.id === selection?.voiceProfileId);
+  if (!selection || (selection.textProfileId !== null && !text) || (selection.voiceProfileId !== null && (!voice || !voice.voiceModel))) {
+    throw new BrowserStorageError("Hãy chọn cấu hình AI có trong danh sách; giọng nói cần model hỗ trợ âm thanh.", 400, "AI_PROFILE_SELECTION_INVALID");
+  }
+  return { textProfileId: selection.textProfileId, voiceProfileId: selection.voiceProfileId };
+}
+
+function retainAiSelection(selection: AiProfileSelection, profiles: StoredAiProfile[]): AiProfileSelection {
+  return {
+    textProfileId: profiles.some(profile => profile.id === selection.textProfileId) ? selection.textProfileId : null,
+    voiceProfileId: profiles.some(profile => profile.id === selection.voiceProfileId && profile.voiceModel) ? selection.voiceProfileId : null,
+  };
+}
+
+function legacyProfile(provider: AiProvider, preferences: AiPreferences): StoredAiProfile {
+  return { id: LEGACY_PROFILE_IDS[provider], label: provider === "gemini" ? "Gemini đã lưu" : "OpenAI đã lưu", provider, textModel: preferences[`${provider}TextModel`], voiceModel: preferences[`${provider}VoiceModel`] || null };
+}
+
+function legacySelection(profiles: StoredAiProfile[], preferences: AiPreferences, keys: Record<AiProvider, string>): AiProfileSelection {
+  const provider = preferences.provider === "auto" ? (keys.gemini ? "gemini" : "openai") : preferences.provider;
+  const profile = profiles.find(candidate => candidate.provider === provider);
+  return { textProfileId: profile?.id || null, voiceProfileId: profile?.voiceModel ? profile.id : null };
+}
 
 export class BrowserStorageError extends Error {
   status: number;
@@ -249,21 +297,152 @@ export class BrowserStorage {
       await requestResult(transaction.objectStore("config").put({ key: "activeCourseId", value: courseId } satisfies ConfigRecord));
     });
   }
-  async getAiPreferences(defaults: AiPreferences = { provider: "auto", openaiTextModel: "gpt-4.1", openaiVoiceModel: "gpt-realtime", geminiTextModel: "gemini-3.8-flash", geminiVoiceModel: "gemini-3.8-live" }): Promise<AiPreferences> {
+  async getAiPreferences(defaults: AiPreferences = fallbackAiPreferences()): Promise<AiPreferences> {
     return (await this.getConfig("aiPreferences") as AiPreferences) || { ...defaults };
   }
-  async setAiPreferences(preferences: AiPreferences): Promise<void> { await this.setConfig("aiPreferences", preferences); }
+  async setAiPreferences(preferences: AiPreferences): Promise<void> {
+    await this.transaction("config", "readwrite", async transaction => {
+      const store = transaction.objectStore("config");
+      const mode = await requestResult(store.get("aiProfilesLegacyMode")) as ConfigRecord | undefined;
+      if (mode?.value !== true) {
+        await requestResult(store.put({ key: "aiPreferences", value: preferences } satisfies ConfigRecord));
+        return;
+      }
+      const [profilesRecord, openaiRecord, geminiRecord] = await Promise.all([
+        requestResult(store.get("aiProfiles")), requestResult(store.get("providerKey:openai")), requestResult(store.get("providerKey:gemini")),
+      ]) as (ConfigRecord | undefined)[];
+      const profiles = ((profilesRecord?.value as StoredAiProfile[] | undefined) || []).map(profile => ({ ...profile, textModel: preferences[`${profile.provider}TextModel`], voiceModel: preferences[`${profile.provider}VoiceModel`] || null }));
+      const keys = { openai: (openaiRecord?.value as string) || "", gemini: (geminiRecord?.value as string) || "" };
+      const selection = legacySelection(profiles, preferences, keys);
+      await requestResult(store.put({ key: "aiProfiles", value: normalizeAiProfiles(profiles) } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiProfileSelection", value: selection } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiPreferences", value: { ...preferences, ...selection } } satisfies ConfigRecord));
+    });
+  }
   async getProviderKey(provider: AiProvider): Promise<string> { return (await this.getConfig(`providerKey:${provider}`) as string) || ""; }
   async setProviderKey(provider: AiProvider, key: string): Promise<void> {
     const trimmed = key.trim();
     await this.transaction("config", "readwrite", async transaction => {
-      if (trimmed) await requestResult(transaction.objectStore("config").put({ key: `providerKey:${provider}`, value: trimmed } satisfies ConfigRecord));
-      else await requestResult(transaction.objectStore("config").delete(`providerKey:${provider}`));
+      const store = transaction.objectStore("config");
+      if (trimmed) await requestResult(store.put({ key: `providerKey:${provider}`, value: trimmed } satisfies ConfigRecord));
+      else await requestResult(store.delete(`providerKey:${provider}`));
+      const mode = await requestResult(store.get("aiProfilesLegacyMode")) as ConfigRecord | undefined;
+      if (mode?.value !== true) return;
+      const [profilesRecord, preferencesRecord, openaiRecord, geminiRecord] = await Promise.all([
+        requestResult(store.get("aiProfiles")), requestResult(store.get("aiPreferences")), requestResult(store.get("providerKey:openai")), requestResult(store.get("providerKey:gemini")),
+      ]) as (ConfigRecord | undefined)[];
+      const preferences = (preferencesRecord?.value as AiPreferences | undefined) || fallbackAiPreferences();
+      const profiles = ((profilesRecord?.value as StoredAiProfile[] | undefined) || []).map(profile => ({ ...profile }));
+      if (trimmed && !profiles.some(profile => profile.id === LEGACY_PROFILE_IDS[provider])) profiles.push(legacyProfile(provider, preferences));
+      if (profiles.some(profile => profile.id === LEGACY_PROFILE_IDS[provider])) {
+        if (trimmed) await requestResult(store.put({ key: `profileKey:${LEGACY_PROFILE_IDS[provider]}`, value: trimmed } satisfies ConfigRecord));
+        else await requestResult(store.delete(`profileKey:${LEGACY_PROFILE_IDS[provider]}`));
+      }
+      const keys = { openai: (openaiRecord?.value as string) || "", gemini: (geminiRecord?.value as string) || "" };
+      const selection = legacySelection(profiles, preferences, keys);
+      await requestResult(store.put({ key: "aiProfiles", value: normalizeAiProfiles(profiles) } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiProfileSelection", value: selection } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiPreferences", value: { ...preferences, ...selection } } satisfies ConfigRecord));
     });
   }
   async getKeyAvailability(): Promise<Record<AiProvider, boolean>> {
     const [openai, gemini] = await Promise.all([this.getProviderKey("openai"), this.getProviderKey("gemini")]);
     return { openai: Boolean(openai), gemini: Boolean(gemini) };
+  }
+
+  async listAiProfiles(): Promise<AiProfile[]> {
+    return this.transaction("config", "readonly", async transaction => {
+      const store = transaction.objectStore("config");
+      const record = await requestResult(store.get("aiProfiles")) as ConfigRecord | undefined;
+      const profiles = normalizeAiProfiles((record?.value as StoredAiProfile[] | undefined) || []);
+      return Promise.all(profiles.map(async profile => {
+        const credential = await requestResult(store.get(`profileKey:${profile.id}`)) as ConfigRecord | undefined;
+        return { ...profile, keyConfigured: typeof credential?.value === "string" && Boolean(credential.value.trim()) };
+      }));
+    });
+  }
+
+  async getAiProfileKey(id: string): Promise<string> {
+    if (!profileIdPattern.test(id)) return "";
+    return (await this.getConfig(`profileKey:${id}`) as string) || "";
+  }
+
+  async getAiProfileSelection(): Promise<AiProfileSelection> {
+    const stored = await this.getConfig("aiProfileSelection") as AiProfileSelection | undefined;
+    return stored ? { textProfileId: stored.textProfileId ?? null, voiceProfileId: stored.voiceProfileId ?? null } : emptyAiSelection();
+  }
+
+  async setAiProfileSelection(selection: AiProfileSelection): Promise<void> {
+    await this.transaction("config", "readwrite", async transaction => {
+      const store = transaction.objectStore("config");
+      const profilesRecord = await requestResult(store.get("aiProfiles")) as ConfigRecord | undefined;
+      const profiles = normalizeAiProfiles((profilesRecord?.value as StoredAiProfile[] | undefined) || []);
+      const validated = validateAiSelection(selection, profiles);
+      const preferences = await requestResult(store.get("aiPreferences")) as ConfigRecord | undefined;
+      await requestResult(store.put({ key: "aiProfileSelection", value: validated } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiPreferences", value: { ...((preferences?.value as AiPreferences | undefined) || fallbackAiPreferences()), ...validated } } satisfies ConfigRecord));
+    });
+  }
+
+  async saveAiProfiles(profiles: StoredAiProfile[], credentials: Record<string, string> = {}, selection?: AiProfileSelection): Promise<void> {
+    const normalized = normalizeAiProfiles(profiles);
+    const ids = new Set(normalized.map(profile => profile.id));
+    if (!credentials || typeof credentials !== "object" || Array.isArray(credentials)
+      || Object.entries(credentials).some(([id, key]) => !ids.has(id) || typeof key !== "string" || key.length > 4000)) {
+      throw new BrowserStorageError("Khóa API phải thuộc một cấu hình AI trong danh sách.", 400, "AI_PROFILE_CREDENTIAL_INVALID");
+    }
+    const explicitSelection = selection === undefined ? undefined : validateAiSelection(selection, normalized);
+    await this.transaction("config", "readwrite", async transaction => {
+      const store = transaction.objectStore("config");
+      const [oldProfilesRecord, oldSelectionRecord, preferencesRecord] = await Promise.all([
+        requestResult(store.get("aiProfiles")), requestResult(store.get("aiProfileSelection")), requestResult(store.get("aiPreferences")),
+      ]) as (ConfigRecord | undefined)[];
+      const oldProfiles = (oldProfilesRecord?.value as StoredAiProfile[] | undefined) || [];
+      const nextSelection = explicitSelection || retainAiSelection((oldSelectionRecord?.value as AiProfileSelection | undefined) || emptyAiSelection(), normalized);
+      await requestResult(store.put({ key: "aiProfiles", value: normalized } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiProfilesLegacyMode", value: false } satisfies ConfigRecord));
+      for (const provider of ["gemini", "openai"] as const) await requestResult(store.delete(`providerKey:${provider}`));
+      for (const old of oldProfiles) {
+        const replacement = normalized.find(profile => profile.id === old.id);
+        if (!replacement || (replacement.provider !== old.provider && !Object.hasOwn(credentials, old.id))) await requestResult(store.delete(`profileKey:${old.id}`));
+      }
+      for (const [id, key] of Object.entries(credentials)) {
+        const trimmed = key.trim();
+        if (trimmed) await requestResult(store.put({ key: `profileKey:${id}`, value: trimmed } satisfies ConfigRecord));
+        else await requestResult(store.delete(`profileKey:${id}`));
+      }
+      await requestResult(store.put({ key: "aiProfileSelection", value: nextSelection } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiPreferences", value: { ...((preferencesRecord?.value as AiPreferences | undefined) || fallbackAiPreferences()), ...nextSelection } } satisfies ConfigRecord));
+    });
+  }
+
+  // Existing browser installations keep their configured keys and models. The
+  // presence of aiProfiles (including an intentionally empty list) is the marker
+  // so deleting every profile never causes the old keys to reappear later. Empty
+  // installations wait until a key exists before marking migration complete.
+  async ensureLegacyAiProfiles(defaultPreferences: AiPreferences): Promise<void> {
+    await this.transaction("config", "readwrite", async transaction => {
+      const store = transaction.objectStore("config");
+      const existing = await requestResult(store.get("aiProfiles"));
+      if (existing) return;
+      const [preferencesRecord, openaiRecord, geminiRecord] = await Promise.all([
+        requestResult(store.get("aiPreferences")), requestResult(store.get("providerKey:openai")), requestResult(store.get("providerKey:gemini")),
+      ]) as (ConfigRecord | undefined)[];
+      const preferences = (preferencesRecord?.value as AiPreferences | undefined) || { ...defaultPreferences };
+      const keys = { openai: typeof openaiRecord?.value === "string" ? openaiRecord.value.trim() : "", gemini: typeof geminiRecord?.value === "string" ? geminiRecord.value.trim() : "" };
+      if (!keys.openai && !keys.gemini) return;
+      const profiles: StoredAiProfile[] = [];
+      for (const provider of ["gemini", "openai"] as const) {
+        if (!keys[provider]) continue;
+        profiles.push(legacyProfile(provider, preferences));
+      }
+      const selection = legacySelection(profiles, preferences, keys);
+      await requestResult(store.put({ key: "aiProfiles", value: normalizeAiProfiles(profiles) } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiProfilesLegacyMode", value: true } satisfies ConfigRecord));
+      for (const profile of profiles) await requestResult(store.put({ key: `profileKey:${profile.id}`, value: keys[profile.provider] } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiProfileSelection", value: selection } satisfies ConfigRecord));
+      await requestResult(store.put({ key: "aiPreferences", value: { ...preferences, ...selection } } satisfies ConfigRecord));
+    });
   }
 }
 

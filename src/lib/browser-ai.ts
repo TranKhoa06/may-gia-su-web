@@ -15,6 +15,7 @@ export const aiPreferencesSchema = z.object({
   provider: z.enum(["auto", "openai", "gemini"]),
   openaiTextModel: modelId, openaiVoiceModel: modelId,
   geminiTextModel: modelId, geminiVoiceModel: modelId,
+  textProfileId: z.string().uuid().nullable().optional(), voiceProfileId: z.string().uuid().nullable().optional(),
 }).strict();
 export const credentialsSchema = z.object({
   gemini: z.string().trim().max(4000).refine(value => !/[\r\n]/.test(value), "Khóa API không được chứa xuống dòng.").optional(),
@@ -31,9 +32,14 @@ function withSelected(models: { id: string; label: string }[], selected: string)
 
 export async function buildAiSettingsState(storage: BrowserStorage): Promise<AiSettingsState> {
   const preferences = aiPreferencesSchema.parse(await storage.getAiPreferences(defaultAiPreferences()));
-  const keys = await storage.getKeyAvailability();
-  const selectedProvider = preferences.provider === "auto" ? (keys.gemini ? "gemini" : "openai") : preferences.provider;
-  return { preferences, selectedProvider, providers: [
+  await storage.ensureLegacyAiProfiles(preferences);
+  const profiles = await storage.listAiProfiles();
+  const selection = await storage.getAiProfileSelection();
+  const textProfile = profiles.find(profile => profile.id === selection.textProfileId);
+  const voiceProfile = profiles.find(profile => profile.id === selection.voiceProfileId);
+  const keys = { gemini: profiles.some(profile => profile.provider === "gemini" && profile.keyConfigured), openai: profiles.some(profile => profile.provider === "openai" && profile.keyConfigured) };
+  const selectedProvider = textProfile?.provider || (preferences.provider === "auto" ? "gemini" : preferences.provider);
+  return { preferences, profiles, selection, selectedProvider, selectedVoiceProvider: voiceProfile?.voiceModel ? voiceProfile.provider : null, providers: [
     { id: "openai", label: "OpenAI (ChatGPT)", keyConfigured: keys.openai,
       textModels: withSelected([{ id: "gpt-4.1", label: "GPT-4.1" }, { id: "gpt-4.1-mini", label: "GPT-4.1 Mini" }], preferences.openaiTextModel),
       voiceModels: withSelected([{ id: "gpt-realtime-1.5", label: "GPT-Realtime 1.5" }, { id: "gpt-realtime", label: "GPT-Realtime" }], preferences.openaiVoiceModel) },
@@ -43,18 +49,23 @@ export async function buildAiSettingsState(storage: BrowserStorage): Promise<AiS
   ] };
 }
 
-export async function getAiConfig(storage: BrowserStorage) {
+export async function getAiConfig(storage: BrowserStorage, mode: "text" | "voice" = "text", profileId?: string) {
   const state = await buildAiSettingsState(storage);
-  const provider = state.selectedProvider;
-  const key = (await storage.getProviderKey(provider)).trim();
-  if (!key) throw new BrowserAiError(503, "AI_NOT_CONFIGURED", "Hãy nhập khóa API trong Cài đặt để bật gia sư. Thêm link NotebookLM chưa bật AI cho web.");
-  return { provider, key, textModel: provider === "gemini" ? state.preferences.geminiTextModel : state.preferences.openaiTextModel, voiceModel: provider === "gemini" ? state.preferences.geminiVoiceModel : state.preferences.openaiVoiceModel };
+  const selectedId = profileId || (mode === "voice" ? state.selection.voiceProfileId : state.selection.textProfileId);
+  const profile = state.profiles.find(profile => profile.id === selectedId);
+  if (profileId && !profile) throw new BrowserAiError(404, "AI_PROFILE_NOT_FOUND", "Cấu hình AI này đã bị xóa hoặc không tồn tại.");
+  if (!profile) throw new BrowserAiError(503, "AI_NOT_CONFIGURED", `Hãy thêm khóa API và chọn cấu hình ${mode === "voice" ? "giọng nói" : "giảng bài"} trong Cài đặt. Thêm link NotebookLM chưa bật AI cho web.`);
+  const key = (await storage.getAiProfileKey(profile.id)).trim();
+  if (!key) throw new BrowserAiError(503, "AI_NOT_CONFIGURED", `Cấu hình ${profile.label} chưa có khóa API. Hãy nhập khóa trong Cài đặt.`);
+  if (mode === "voice" && !profile.voiceModel) throw new BrowserAiError(503, "AI_VOICE_NOT_CONFIGURED", "Cấu hình đã chọn chưa có model giọng nói. Hãy chọn cấu hình có model Live hoặc Realtime.");
+  return { provider: profile.provider, key, textModel: profile.textModel, voiceModel: profile.voiceModel || "", profileId: profile.id, label: profile.label };
 }
 export type BrowserAiConfig = Awaited<ReturnType<typeof getAiConfig>>;
 export type TextGeneration = {
   instructions: string;
   messages: { role: "user" | "assistant"; content: string; images?: SourceImage[] }[];
   schema: Record<string, unknown>; schemaName: string; maxOutputTokens: number; signal?: AbortSignal | null;
+  profileId?: string;
 };
 
 function providerError(provider: AiProvider, status: number): BrowserAiError {
@@ -128,7 +139,7 @@ export function extractOpenAiText(result: Record<string, any>): string {
 }
 
 export async function generateTutorText(storage: BrowserStorage, input: TextGeneration, fetchImplementation: typeof fetch = fetch): Promise<string> {
-  const config = await getAiConfig(storage);
+  const config = await getAiConfig(storage, "text", input.profileId);
   const signal = combinedSignal(input.signal);
   if (config.provider === "gemini") {
     const result = await providerRequest("gemini", `https://generativelanguage.googleapis.com/v1beta/models/${config.textModel}:generateContent`, {
@@ -148,7 +159,7 @@ export async function generateTutorText(storage: BrowserStorage, input: TextGene
 
 /** A user supplies their own key. No site owner's shared key or token server is published. */
 export async function createVoiceSession(storage: BrowserStorage, instructions: string, signal?: AbortSignal | null, fetchImplementation: typeof fetch = fetch): Promise<{ value: string; model: string; provider: AiProvider }> {
-  const config = await getAiConfig(storage);
+  const config = await getAiConfig(storage, "voice");
   if (config.provider === "gemini") {
     try {
       // The browser SDK supports authTokens.create; only Google receives the key.

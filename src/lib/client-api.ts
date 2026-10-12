@@ -107,8 +107,11 @@ function canonicalRefs(references: SourceRef[], validRefs: SourceRef[]) {
 
 async function state(storage: BrowserStorage, selectedId: string | null) {
   const aiSettings = await buildAiSettingsState(storage);
-  const aiReady = aiSettings.providers.find(provider => provider.id === aiSettings.selectedProvider)?.keyConfigured || false;
-  const aiState = { aiSettings, aiReady, voiceReady: aiReady, aiProvider: aiReady ? aiSettings.selectedProvider : null };
+  const textProfile = aiSettings.profiles.find(profile => profile.id === aiSettings.selection.textProfileId);
+  const voiceProfile = aiSettings.profiles.find(profile => profile.id === aiSettings.selection.voiceProfileId);
+  const aiReady = !!textProfile?.keyConfigured;
+  const voiceReady = !!voiceProfile?.keyConfigured && !!voiceProfile.voiceModel;
+  const aiState = { aiSettings, aiReady, voiceReady, aiProvider: aiReady ? textProfile!.provider : null, voiceProvider: voiceReady ? voiceProfile!.provider : null };
   const courses = await storage.listCourses();
   if (selectedId) idSchema.parse(selectedId);
   const activeId = selectedId || await storage.getActiveCourseId();
@@ -216,19 +219,20 @@ async function prepareVoiceContext(storage: BrowserStorage, init: RequestInit) {
 }
 
 async function voiceSession(storage: BrowserStorage, init: RequestInit) {
-  await getAiConfig(storage); rateLimit("voice", 4);
+  await getAiConfig(storage, "voice"); rateLimit("voice", 4);
   const context = await prepareVoiceContext(storage, init);
   return json({ ...await createVoiceSession(storage, context.instructions, init.signal), ...context });
 }
 
 async function testAiConnection(storage: BrowserStorage, init: RequestInit) {
-  const config = await getAiConfig(storage); rateLimit("ai-test", 3);
+  const data = init.body ? z.object({ profileId: idSchema.optional() }).strict().parse(body(init)) : {};
+  const config = await getAiConfig(storage, "text", data.profileId); rateLimit(`ai-test:${config.profileId}`, 3);
   const result = await generateTutorText(storage, {
     instructions: "Trả JSON theo cấu trúc, trường ok bằng true.", messages: [{ role: "user", content: "Kiểm tra kết nối gia sư, chỉ trả ok=true." }],
-    schemaName: "connection_test", schema: { type: "object", additionalProperties: false, properties: { ok: { type: "boolean" } }, required: ["ok"] }, maxOutputTokens: 1000, signal: init.signal,
+    schemaName: "connection_test", schema: { type: "object", additionalProperties: false, properties: { ok: { type: "boolean" } }, required: ["ok"] }, maxOutputTokens: 1000, signal: init.signal, profileId: config.profileId,
   });
   if (JSON.parse(result).ok !== true) throw new ClientApiError(502, "AI chưa trả lời đúng yêu cầu kiểm tra.");
-  return json({ provider: config.provider, textModel: config.textModel, message: `Đã kết nối ${config.provider === "gemini" ? "Gemini" : "OpenAI"} với model ${config.textModel}. Giọng nói cần kiểm tra riêng khi bắt đầu buổi học và cấp quyền micro.` });
+  return json({ provider: config.provider, profileId: config.profileId, textModel: config.textModel, message: `Đã kết nối cấu hình ${config.label} với model ${config.textModel}. Giọng nói cần kiểm tra riêng khi bắt đầu buổi học và cấp quyền micro.` });
 }
 
 async function transcript(storage: BrowserStorage, init: RequestInit) {
@@ -248,7 +252,36 @@ async function transcript(storage: BrowserStorage, init: RequestInit) {
 
 async function aiSettings(storage: BrowserStorage, init: RequestInit, method: string) {
   if (method === "GET") return json(await buildAiSettingsState(storage));
-  const input = z.record(z.unknown()).parse(body(init));
+  const input = z.record(z.unknown()).parse(body(init, 128000));
+  if ("profiles" in input || "selection" in input) {
+    const model = z.string().trim().min(1, "Nhập tên model.").max(160).regex(/^[A-Za-z0-9._-]+$/, "Tên model chưa hợp lệ.");
+    const schema = z.object({
+      profiles: z.array(z.object({
+        id: idSchema, label: z.string().trim().min(1, "Đặt tên cho cấu hình AI.").max(120), provider: z.enum(["gemini", "openai"]),
+        textModel: model, voiceModel: model.nullable(),
+        apiKey: z.string().trim().max(4000).refine(key => !/[\r\n]/.test(key), "Mỗi cấu hình chỉ dùng một khóa API.").optional(),
+      }).strict()).max(20, "Bạn có thể lưu tối đa 20 cấu hình AI.").optional(),
+      selection: z.object({ textProfileId: idSchema.nullable(), voiceProfileId: idSchema.nullable() }).strict().optional(),
+    }).strict();
+    const data = schema.parse(input);
+    if (data.profiles && new Set(data.profiles.map(profile => profile.id)).size !== data.profiles.length) throw new ClientApiError(400, "Các cấu hình AI phải có mã riêng.");
+    const current = await buildAiSettingsState(storage);
+    const profiles = data.profiles || current.profiles;
+    const credentials: Record<string, string> = {};
+    for (const profile of data.profiles || []) {
+      const previous = current.profiles.find(saved => saved.id === profile.id);
+      if (profile.apiKey?.trim()) credentials[profile.id] = profile.apiKey.trim();
+      else if (!previous || previous.provider !== profile.provider) throw new ClientApiError(400, "Cấu hình mới hoặc đổi dịch vụ cần nhập khóa API tương ứng.");
+    }
+    let selection = data.selection || {
+      textProfileId: profiles.some(profile => profile.id === current.selection.textProfileId) ? current.selection.textProfileId : null,
+      voiceProfileId: profiles.some(profile => profile.id === current.selection.voiceProfileId && profile.voiceModel) ? current.selection.voiceProfileId : null,
+    };
+    if (selection.textProfileId && !profiles.some(profile => profile.id === selection.textProfileId)) throw new ClientApiError(400, "Cấu hình giảng bài đã chọn không tồn tại.");
+    if (selection.voiceProfileId && !profiles.some(profile => profile.id === selection.voiceProfileId && profile.voiceModel)) throw new ClientApiError(400, "Chọn cấu hình có model giọng nói Live hoặc Realtime.");
+    await storage.saveAiProfiles(profiles.map(({ id, label, provider, textModel, voiceModel }) => ({ id, label, provider, textModel, voiceModel })), credentials, selection);
+    return json(await buildAiSettingsState(storage));
+  }
   const preferences = aiPreferencesSchema.parse(input.preferences || (() => { const { credentials: _credentials, ...fields } = input; return fields; })());
   const credentials = credentialsSchema.parse(input.credentials || {});
   // Validate all input before any write; no API key is included in this response.
